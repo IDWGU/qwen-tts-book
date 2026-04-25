@@ -3,11 +3,6 @@
 Qwen3-TTS 有声书生成器 - WebUI (Gradio)
 ==========================================
 
-基于 Qwen3-TTS (Apache 2.0) — 阿里通义千问团队
-  GitHub: https://github.com/QwenLM/Qwen3-TTS
-  论文: https://arxiv.org/abs/2601.15621
-  PyPI: qwen-tts
-
 启动:
   source venv/bin/activate
   python webui.py
@@ -42,6 +37,10 @@ class AppState:
         self.model_loaded = False
         self.model_path = ""
         self.sample_rate = 24000
+        # 分段生成工作流
+        self.segments: List[str] = []           # 各段文本
+        self.segment_audios: List[Optional[np.ndarray]] = []  # 各段音频
+        self.segment_sr: int = 24000             # 采样率
 
 
 state = AppState()
@@ -280,39 +279,67 @@ def preview_segments(text: str, max_seg_len: int) -> str:
     return "\n".join(lines)
 
 
-def generate_speech(
-    text: str,
-    language: str,
-    max_seg_len: int,
-    max_new_tokens: int,
-    temperature: float,
-    top_k: int,
-    top_p: int,
-    repetition_penalty: float,
-    subtalker_temperature: float,
-    subtalker_top_k: int,
-    subtalker_top_p: float,
-    speed: float,
-    segment_gap: float,
-    breathing_pause: float,
-    progress: gr.Progress = gr.Progress(),
-) -> Tuple[Optional[str], str, str, str]:
-    """Returns: (audio_tuple, clone_status, gen_status, log)"""
+def get_segment_status_display() -> str:
+    """Build status text showing each segment's state."""
+    if not state.segments:
+        return "⏳ 请先分段文本"
+    lines = [f"📄 共 {len(state.segments)} 段"]
+    for i, seg in enumerate(state.segments):
+        audio = state.segment_audios[i] if i < len(state.segment_audios) else None
+        icon = "✅" if audio is not None else "⏳"
+        preview = seg[:40].replace("\n", "\\n")
+        if len(seg) > 40:
+            preview += "..."
+        lines.append(f"  {icon} 段 [{i+1}] ({len(seg)}字): {preview}")
+    return "\n".join(lines)
+
+
+def do_segment(text: str, max_seg_len: int) -> Tuple[str, gr.update, str]:
+    """Segment text, store in state, return preview + dropdown update + status."""
     global state
+    if not text or not text.strip():
+        state.segments = []
+        state.segment_audios = []
+        return "⚠️ 请输入文本", gr.update(choices=[], value=None, interactive=False), ""
 
+    segs = segment_text(text.strip(), max_chars=max_seg_len)
+    state.segments = segs
+    state.segment_audios = [None] * len(segs)
+    state.segment_sr = 24000
+
+    preview = preview_segments(text, max_seg_len)
+    choices = [f"段 {i+1} ({len(seg)}字)" for i, seg in enumerate(segs)]
+    status = get_segment_status_display()
+
+    return preview, gr.update(
+        choices=choices, value=choices[0] if choices else None, interactive=True
+    ), status
+
+
+def generate_segment(
+    seg_label: str, language: str, max_new_tokens: int,
+    temperature: float, top_k: int, top_p: int, repetition_penalty: float,
+    subtalker_temperature: float, subtalker_top_k: int, subtalker_top_p: float,
+) -> Tuple[Optional[Tuple[int, np.ndarray]], str]:
+    """Generate audio for a single selected segment."""
+    global state
     if not state.model_loaded or state.tts is None:
-        return None, "", "❌ 请先加载模型", ""
+        return None, "❌ 请先加载模型"
     if state.prompt_items is None:
-        return None, "", "❌ 请先创建音色克隆", ""
-    text = text.strip()
-    if not text:
-        return None, "", "❌ 请输入文本", ""
+        return None, "❌ 请先创建音色克隆"
+    if not state.segments:
+        return None, "❌ 请先分段文本"
+    if not seg_label:
+        return None, "❌ 请选择段落"
 
-    segs = segment_text(text, max_chars=max_seg_len)
-    if not segs:
-        return None, "", "❌ 分段结果为空", ""
+    try:
+        seg_idx = int(seg_label.split()[1]) - 1
+    except (ValueError, IndexError):
+        return None, "❌ 无效的段落选择"
+    if seg_idx < 0 or seg_idx >= len(state.segments):
+        return None, "❌ 段号超出范围"
 
-    log_lines = [f"📄 文本 {len(text)} 字 → {len(segs)} 段"]
+    seg_text = state.segments[seg_idx]
     gen_kwargs = dict(
         max_new_tokens=max_new_tokens, do_sample=True,
         top_k=top_k, top_p=top_p, temperature=temperature,
@@ -321,58 +348,114 @@ def generate_speech(
         subtalker_top_p=subtalker_top_p, subtalker_temperature=subtalker_temperature,
     )
 
-    # ---- 生成 ----
-    all_wavs: List[np.ndarray] = []
-    seg_texts: List[str] = []
-    sr = state.sample_rate
-    total_gen_time = 0.0
+    try:
+        wavs, sr = state.tts.generate_voice_clone(
+            text=seg_text, language=language,
+            voice_clone_prompt=state.prompt_items, **gen_kwargs,
+        )
+        state.segment_audios[seg_idx] = wavs[0]
+        state.segment_sr = sr
+        return (sr, wavs[0]), get_segment_status_display()
+    except Exception as e:
+        return None, f"❌ 段 [{seg_idx+1}] 生成失败: {e}\n\n{get_segment_status_display()}"
 
-    for i, seg_text in enumerate(segs):
-        progress((i + 0.5) / len(segs), desc=f"合成段 [{i+1}/{len(segs)}]")
-        t0 = time.time()
+
+def generate_all_segments(
+    language: str, max_new_tokens: int,
+    temperature: float, top_k: int, top_p: int, repetition_penalty: float,
+    subtalker_temperature: float, subtalker_top_k: int, subtalker_top_p: float,
+    progress: gr.Progress = gr.Progress(),
+) -> Tuple[Optional[Tuple[int, np.ndarray]], str]:
+    """Generate all un-generated segments sequentially."""
+    global state
+    if not state.model_loaded or state.tts is None:
+        return None, "❌ 请先加载模型"
+    if state.prompt_items is None:
+        return None, "❌ 请先创建音色克隆"
+    if not state.segments:
+        return None, "❌ 请先分段文本"
+
+    gen_kwargs = dict(
+        max_new_tokens=max_new_tokens, do_sample=True,
+        top_k=top_k, top_p=top_p, temperature=temperature,
+        repetition_penalty=repetition_penalty,
+        subtalker_dosample=True, subtalker_top_k=subtalker_top_k,
+        subtalker_top_p=subtalker_top_p, subtalker_temperature=subtalker_temperature,
+    )
+
+    total = len(state.segments)
+    last_audio = None
+    errors = 0
+
+    for i in range(total):
+        if state.segment_audios[i] is not None:
+            continue
+
+        progress((i + 0.5) / total, desc=f"合成段 [{i+1}/{total}]")
         try:
-            wavs, sr_out = state.tts.generate_voice_clone(
-                text=seg_text, language=language,
+            wavs, sr = state.tts.generate_voice_clone(
+                text=state.segments[i], language=language,
                 voice_clone_prompt=state.prompt_items, **gen_kwargs,
             )
-            elapsed = time.time() - t0
-            total_gen_time += elapsed
-            sr = sr_out
-            all_wavs.append(wavs[0])
-            seg_texts.append(seg_text)
-            log_lines.append(f"  ✅ 段[{i+1}/{len(segs)}] {len(wavs[0])/sr:.1f}s ({elapsed:.1f}s)")
+            state.segment_audios[i] = wavs[0]
+            state.segment_sr = sr
+            last_audio = (sr, wavs[0])
         except Exception as e:
-            log_lines.append(f"  ❌ 段[{i+1}] 失败: {e}")
+            errors += 1
 
-    if not all_wavs:
-        return None, "", "❌ 所有段落均生成失败", "\n".join(log_lines)
+    done = sum(1 for a in state.segment_audios if a is not None)
+    summary = f"✅ 已完成 {done}/{total} 段"
+    if errors:
+        summary += f" ({errors} 段失败)"
 
-    # ---- 后处理 ----
-    progress(0.92, desc="后处理中...")
-    log_lines.append(f"\n🔊 后处理: 语速={speed}x, 段间停顿={segment_gap}s, 气口={breathing_pause}s")
+    return last_audio, f"{summary}\n{get_segment_status_display()}"
 
-    # 1) 句间气口
-    if breathing_pause > 0:
-        pwavs = []
-        for wav, stxt in zip(all_wavs, seg_texts):
-            pwavs.append((insert_breathing_pauses(wav, stxt, sr, breathing_pause), sr))
-    else:
-        pwavs = [(w, sr) for w in all_wavs]
 
-    # 2) 合并 + 段间停顿
+def merge_segments(
+    speed: float, segment_gap: float, breathing_pause: float,
+    progress: gr.Progress = gr.Progress(),
+) -> Tuple[Optional[Tuple[int, np.ndarray]], str]:
+    """Merge all generated segments into final audio."""
+    global state
+    if not state.segment_audios or all(a is None for a in state.segment_audios):
+        return None, "❌ 没有已生成的段落，请先生成"
+
+    generated = [(i, a) for i, a in enumerate(state.segment_audios) if a is not None]
+    total = len(state.segment_audios)
+    done = len(generated)
+
+    warn = ""
+    if done < total:
+        n_missing = total - done
+        if n_missing == total:
+            return None, "❌ 所有段落均未生成，请先生成"
+        warn = f"⚠️ 还有 {n_missing} 段未生成，仅合并已生成的 {done}/{total} 段\n\n"
+
+    progress(0.1, desc="后处理中...")
+    sr = state.segment_sr
+    all_wavs = [a for _, a in generated]
+    seg_texts = [state.segments[i] for i, _ in generated]
+
+    pwavs = []
+    for wav, stxt in zip(all_wavs, seg_texts):
+        if breathing_pause > 0:
+            wav = insert_breathing_pauses(wav, stxt, sr, breathing_pause)
+        pwavs.append((wav, sr))
+
     merged_wav, sr = merge_audio_segments(pwavs, segment_gap=segment_gap)
 
-    # 3) 变速
     if abs(speed - 1.0) > 0.01:
+        progress(0.5, desc="变速处理中...")
         merged_wav = adjust_speed(merged_wav, sr, speed)
 
     total_dur = len(merged_wav) / sr
-    log_lines.append(f"\n{'='*40}")
-    log_lines.append(f"✅ 合成完成! {total_dur:.1f}s ({total_dur/60:.1f} 分钟)")
-    log_lines.append(f"   总段数: {len(all_wavs)}, 生成耗时: {total_gen_time:.1f}s")
-    log_lines.append(f"{'='*40}")
+    status = (
+        f"{warn}🔗 合并完成! {total_dur:.1f}s ({total_dur/60:.1f} 分钟)\n"
+        f"   不满意可重新生成某段后再点合并\n"
+        f"{get_segment_status_display()}"
+    )
 
-    return (sr, merged_wav), "✅ 合成完成", f"✅ 完成！{total_dur:.1f}s", "\n".join(log_lines)
+    return (sr, merged_wav), status
 
 
 # =====================================================================
@@ -481,46 +564,86 @@ def build_ui():
                     info="句与句之间的短停顿，0 关闭",
                 )
 
-        # ---- 操作按钮 ----
+        # ---- 第四步：分段预览 ----
         with gr.Row():
             preview_btn = gr.Button("🔍 预览分段", variant="secondary", size="sm")
-            generate_btn = gr.Button("🎬 开始生成有声书", variant="primary", size="lg", scale=2)
-
-        # ---- 分段预览 ----
         seg_preview = gr.Textbox(
             label="分段预览", value="点击「预览分段」查看文本分割结果",
-            lines=12, max_lines=25, interactive=False, elem_classes="seg-preview",
+            lines=10, max_lines=20, interactive=False, elem_classes="seg-preview",
         )
 
-        # ---- 结果 ----
+        # ---- 第五步：逐段测试 ----
+        gr.Markdown("### 🎯 逐段生成与试听")
         with gr.Row():
-            audio_output = gr.Audio(label="生成结果", type="numpy", interactive=False)
-        gen_log = gr.Textbox(label="生成日志", lines=8, max_lines=20, interactive=False)
+            segment_selector = gr.Dropdown(
+                label="选择段落", choices=[], interactive=False, scale=2,
+            )
+            gen_one_btn = gr.Button("▶️ 生成该段", variant="secondary", scale=1)
+            gen_all_btn = gr.Button("⏩ 生成所有段", variant="secondary", scale=1)
+        with gr.Row():
+            seg_audio_preview = gr.Audio(label="单段试听", type="numpy", interactive=False)
+        seg_status = gr.Textbox(
+            label="段落状态", value="⏳ 请先预览分段",
+            lines=8, max_lines=20, interactive=False, elem_classes="seg-preview",
+        )
 
-        # ---- 回调 ----
+        # ---- 第六步：合并 ----
+        with gr.Row():
+            merge_btn = gr.Button("🔗 合并已生成段落", variant="primary", size="lg", scale=2)
+        with gr.Row():
+            audio_output = gr.Audio(label="合并结果", type="numpy", interactive=False)
+
+        # ---- 进度条 ----
+        progress_bar = gr.HTML("")
+        # 进度组件由 Gradio 自动处理（gr.Progress），无需绑定
+
+        # =====================================================================
+        # 回调
+        # =====================================================================
+
+        # 模型
         load_model_btn.click(fn=load_model, inputs=[model_path, device, dtype], outputs=[model_status])
         unload_model_btn.click(fn=unload_model, outputs=[model_status])
 
+        # 文件上传
         text_file.upload(
             fn=lambda f: Path(f.name).read_text("utf-8") if f else "",
             inputs=[text_file], outputs=[text_input],
         )
 
-        preview_btn.click(fn=preview_segments, inputs=[text_input, max_seg_len], outputs=[seg_preview])
-
+        # 音色
         analyze_btn.click(fn=analyze_voice_profile, inputs=[ref_audio], outputs=[voice_profile])
         clone_btn.click(fn=create_voice_clone, inputs=[ref_audio, ref_text, use_xvec], outputs=[clone_status])
 
-        # 点击生成：先预览分段，再逐段合成
-        generate_btn.click(
-            fn=preview_segments, inputs=[text_input, max_seg_len], outputs=[seg_preview],
-        ).then(
-            fn=generate_speech,
-            inputs=[text_input, language, max_seg_len, max_new_tokens,
-                    temperature, top_k, top_p, repetition_penalty,
-                    subtalker_temperature, subtalker_top_k, subtalker_top_p,
-                    speed, segment_gap, breathing_pause],
-            outputs=[audio_output, clone_status, gen_status, gen_log],
+        # 预览分段 → 同时更新分段预览、段落选择器、段落状态
+        gen_inputs = [text_input, max_seg_len]
+        seg_outputs = [seg_preview, segment_selector, seg_status]
+        preview_btn.click(fn=do_segment, inputs=gen_inputs, outputs=seg_outputs)
+
+        # 生成单段
+        gen_params = [
+            language, max_new_tokens,
+            temperature, top_k, top_p, repetition_penalty,
+            subtalker_temperature, subtalker_top_k, subtalker_top_p,
+        ]
+        gen_one_btn.click(
+            fn=generate_segment,
+            inputs=[segment_selector] + gen_params,
+            outputs=[seg_audio_preview, seg_status],
+        )
+
+        # 生成所有段
+        gen_all_btn.click(
+            fn=generate_all_segments,
+            inputs=gen_params,
+            outputs=[seg_audio_preview, seg_status],
+        )
+
+        # 合并
+        merge_btn.click(
+            fn=merge_segments,
+            inputs=[speed, segment_gap, breathing_pause],
+            outputs=[audio_output, seg_status],
         )
 
     return demo

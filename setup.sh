@@ -50,9 +50,16 @@ pip install \
     "sentencepiece" \
     -q
 
-# 安装 qwen-tts 包 (从 PyPI)
-echo "从 PyPI 安装 qwen-tts..."
-pip install -U qwen-tts -q
+# 安装 qwen-tts 包 (从本地源码)
+QWEEN_TTS_DIR="/tmp/Qwen3-TTS"
+if [ -d "$QWEEN_TTS_DIR" ]; then
+    echo "从本地源码安装 qwen-tts..."
+    pip install -e "$QWEEN_TTS_DIR" -q
+else
+    echo "警告: $QWEEN_TTS_DIR 不存在，请先克隆仓库"
+    echo "  git clone https://github.com/QwenLM/Qwen3-TTS.git /tmp/Qwen3-TTS"
+    exit 1
+fi
 
 echo ""
 echo "=== 安装完成 ==="

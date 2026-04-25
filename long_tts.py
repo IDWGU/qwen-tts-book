@@ -3,11 +3,6 @@
 Qwen3-TTS 长文本有声书生成工具
 ==================================
 
-基于 Qwen3-TTS (Apache 2.0) — 阿里通义千问团队
-  GitHub: https://github.com/QwenLM/Qwen3-TTS
-  论文: https://arxiv.org/abs/2601.15621
-  PyPI: qwen-tts
-
 功能:
   1. 加载 Qwen3-TTS Base 模型 + 音色克隆
   2. 读取长文本（文件或标准输入）
