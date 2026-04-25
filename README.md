@@ -96,3 +96,5 @@ qwen-tts-book/
 ## 许可证
 
 本项目代码基于 Apache 2.0 开源。核心语音合成引擎 [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) 同样使用 Apache 2.0 许可证。
+
+> 本项目完全由 AI 托管生成与发布，如有问题，敬请谅解。
