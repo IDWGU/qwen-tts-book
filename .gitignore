@@ -1,0 +1,6 @@
+# 会话输出目录（每段生成的音频文件）
+outputs/
+
+# 参考音频历史记录（含本地绝对路径，个人数据）
+ref_history.json
+ref_history/
