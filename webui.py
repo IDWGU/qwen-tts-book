@@ -12,7 +12,9 @@ Qwen3-TTS 有声书生成器 - WebUI (Gradio)
 import datetime
 import gc
 import json
+import os
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -25,7 +27,8 @@ import soundfile as sf
 import torch
 
 from long_tts import Qwen3TTSModel, segment_text, merge_audio_segments
-from long_tts import adjust_speed, insert_breathing_pauses, split_sentences
+from long_tts import adjust_speed, insert_breathing_pauses, normalize_audio, split_sentences
+from long_tts import init_asr, verify_segment_head_tail
 
 import ref_history
 
@@ -54,6 +57,9 @@ class AppState:
         self.segment_sr: int = 24000             # 采样率
         self.source_text: str = ""               # 原始输入文本
         self.session_name: Optional[str] = None  # 当前会话时间戳，如 "20260426195412"
+        # 控制台追踪
+        self.start_time: float = 0.0             # 会话开始时间戳
+        self.segment_times: List[Optional[float]] = []  # 各段生成耗时(s)
 
     def lock(self):
         return self._lock
@@ -163,6 +169,108 @@ def _save_current_session():
                   state.segment_audios, state.segment_sr)
 
 
+# =====================================================================
+# 控制台（右侧面板）
+# =====================================================================
+
+def _build_console_html() -> str:
+    """生成右侧控制台面板的 HTML 内容。"""
+    with state:
+        model_ok = state.model_loaded
+        voice_ok = state.prompt_items is not None
+        has_text = bool(state.source_text.strip()) if state.source_text else False
+        has_segments = len(state.segments) > 0
+        seg_count = len(state.segments)
+        gen_count = sum(1 for a in state.segment_audios if a is not None)
+        seg_times = [t for t in state.segment_times if t is not None]
+        start = state.start_time
+        merged = False  # will be set when merge is done; can be inferred later
+
+    # 已用时间
+    elapsed = time.time() - start if start > 0 else 0
+    elapsed_str = f"{int(elapsed // 60):02d}:{int(elapsed % 60):02d}"
+
+    # ---- 确定当前工作流阶段 ----
+    if not model_ok:
+        current_step, step_desc = 1, "加载模型"
+    elif not voice_ok:
+        current_step, step_desc = 2, "创建音色"
+    elif not has_text:
+        current_step, step_desc = 3, "输入文本"
+    elif not has_segments:
+        current_step, step_desc = 4, "预览分段"
+    elif gen_count < seg_count:
+        current_step, step_desc = 5, "逐段生成"
+    else:
+        current_step, step_desc = 6, "后处理合并"
+
+    step_names = [
+        "① 加载模型",
+        "② 创建音色",
+        "③ 输入文本",
+        "④ 预览分段",
+        "⑤ 逐段生成",
+        "⑥ 后处理合并",
+    ]
+
+    steps_html = ""
+    for i, name in enumerate(step_names):
+        idx = i + 1
+        if idx < current_step:
+            icon, cls = "✅", "step-done"
+        elif idx == current_step:
+            icon, cls = "▶", "step-active"
+        else:
+            icon, cls = "⏳", "step-pending"
+        if idx == 5 and seg_count > 0:
+            label = f"{name}  [{gen_count}/{seg_count} 段]"
+        else:
+            label = name
+        steps_html += f'<div class="console-step {cls}">{icon} {label}</div>'
+
+    # ---- 统计信息 ----
+    stats_html = ""
+    stats_html += f'<div class="console-stat"><span class="stat-label">已用时间</span><span class="stat-value">{elapsed_str}</span></div>'
+    stats_html += f'<div class="console-stat"><span class="stat-label">总字数</span><span class="stat-value">{len(state.source_text):,}</span></div>'
+    stats_html += f'<div class="console-stat"><span class="stat-label">总段数</span><span class="stat-value">{seg_count}</span></div>'
+    stats_html += f'<div class="console-stat"><span class="stat-label">已生成</span><span class="stat-value">{gen_count}/{seg_count}</span></div>'
+    stats_html += f'<div class="console-stat"><span class="stat-label">会话</span><span class="stat-value">{state.session_name or "—"}</span></div>'
+    if merged:
+        stats_html += '<div class="console-stat"><span class="stat-label">合并</span><span class="stat-value">✅ 已完成</span></div>'
+
+    # ---- 各段用时 ----
+    timing_html = ""
+    if seg_times:
+        # 只显示最近 20 段，避免太长
+        display_times = seg_times[-20:]
+        for i, t in enumerate(display_times):
+            real_idx = len(seg_times) - len(display_times) + i
+            timing_html += f'<div class="console-timing">段 {real_idx+1}: {t:.1f}s</div>'
+        if len(seg_times) > 20:
+            timing_html += f'<div class="console-timing">...（共 {len(seg_times)} 段）</div>'
+
+    html = f"""<div class="console-panel">
+  <h3 class="console-title">🎛 控制台</h3>
+
+  <div class="console-section">
+    <div class="console-section-title">▶ 工作流</div>
+    {steps_html}
+    <div class="console-hint">当前阶段: {step_desc}</div>
+  </div>
+
+  <div class="console-section">
+    <div class="console-section-title">📊 统计</div>
+    {stats_html}
+  </div>
+
+  <div class="console-section">
+    <div class="console-section-title">⏱ 各段用时</div>
+    {timing_html if timing_html else '<div class="console-timing" style="color:#888">暂无数据</div>'}
+  </div>
+</div>"""
+    return html
+
+
 def _resolve_local_cache(repo_id: str) -> Optional[str]:
     """Resolve a HuggingFace repo ID to a local cache snapshot path if cached.
 
@@ -204,10 +312,10 @@ def _resolve_local_cache(repo_id: str) -> Optional[str]:
 # 核心逻辑
 # =====================================================================
 
-def load_model(model_path: str, device: str, dtype_str: str) -> str:
+def load_model(model_path: str, device: str, dtype_str: str) -> Tuple[str, str]:
     with state:
         if state.model_loaded and state.model_path == model_path:
-            return f"✅ 模型已加载: {model_path}"
+            return f"✅ 模型已加载: {model_path}", _build_console_html()
 
     # 自动解析 repo ID 到本地缓存路径，避免 huggingface_hub 网络重试
     resolved = _resolve_local_cache(model_path) or model_path
@@ -234,19 +342,19 @@ def load_model(model_path: str, device: str, dtype_str: str) -> str:
             state.model_loaded = True
             state.model_path = model_path
             state.prompt_items = None  # 模型变更后重置音色
-        return f"✅ 模型加载完成 ({time.time() - t0:.1f}s)"
+        return f"✅ 模型加载完成 ({time.time() - t0:.1f}s)", _build_console_html()
     except Exception as e:
         with state:
             state.model_loaded = False
             state.tts = None
-        return f"❌ 模型加载失败: {e}"
+        return f"❌ 模型加载失败: {e}", _build_console_html()
 
 
-def unload_model() -> str:
+def unload_model() -> Tuple[str, str]:
     with state:
         tts = state.tts
         if tts is None:
-            return "⏳ 模型未加载"
+            return "⏳ 模型未加载", _build_console_html()
         state.tts = None
         state.prompt_items = None
         state.model_loaded = False
@@ -259,9 +367,9 @@ def unload_model() -> str:
         # MPS （macOS GPU）也需要清理缓存
         if hasattr(torch, 'mps') and hasattr(torch.mps, 'empty_cache'):
             torch.mps.empty_cache()
-        return "✅ 模型已从内存卸载"
+        return "✅ 模型已从内存卸载", _build_console_html()
     except Exception as e:
-        return f"❌ 卸载失败: {e}"
+        return f"❌ 卸载失败: {e}", _build_console_html()
 
 
 def load_from_history(selected: str) -> Tuple[gr.update, gr.update, gr.update]:
@@ -283,14 +391,14 @@ def load_from_history(selected: str) -> Tuple[gr.update, gr.update, gr.update]:
 
 def create_voice_clone(
     audio_path: str, ref_text: str, use_xvec: bool, ref_name: str,
-) -> Tuple[str, gr.update]:
+) -> Tuple[str, gr.update, str]:
     """创建音色克隆，同时自动保存到历史记录。"""
     with state as s:
         if not s.model_loaded or s.tts is None:
-            return "❌ 请先加载模型", gr.update()
+            return "❌ 请先加载模型", gr.update(), _build_console_html()
         tts = s.tts
     if not audio_path:
-        return "❌ 请上传参考音频", gr.update()
+        return "❌ 请上传参考音频", gr.update(), _build_console_html()
     try:
         if use_xvec:
             prompt_items = tts.create_voice_clone_prompt(
@@ -298,7 +406,7 @@ def create_voice_clone(
             )
         else:
             if not ref_text or not ref_text.strip():
-                return "❌ ICL 模式需要提供参考音频的文字内容", gr.update()
+                return "❌ ICL 模式需要提供参考音频的文字内容", gr.update(), _build_console_html()
             prompt_items = tts.create_voice_clone_prompt(
                 ref_audio=audio_path, ref_text=ref_text.strip(), x_vector_only_mode=False,
             )
@@ -319,12 +427,12 @@ def create_voice_clone(
         msg = "✅ 音色克隆完成"
         if ref_name and ref_name.strip():
             msg += f"，已保存为「{ref_name.strip()}」"
-        return msg, gr.update(choices=new_choices)
+        return msg, gr.update(choices=new_choices), _build_console_html()
 
     except Exception as e:
         with state:
             state.prompt_items = None
-        return f"❌ 音色克隆失败: {e}", gr.update()
+        return f"❌ 音色克隆失败: {e}", gr.update(), _build_console_html()
 
 
 def _vad_speech_ratio(y: np.ndarray, sr: int,
@@ -518,21 +626,26 @@ def get_segment_status_display() -> str:
     return "\n".join(lines)
 
 
-def do_segment(text: str, max_seg_len: int) -> Tuple[str, gr.update, str]:
+def do_segment(text: str, max_seg_len: int) -> Tuple[str, gr.update, str, str]:
     """Segment text, store in state, return preview + dropdown update + status."""
     if not text or not text.strip():
         with state:
             state.segments = []
             state.segment_audios = []
+            state.segment_times = []
             state.source_text = ""
-        return "⚠️ 请输入文本", gr.update(choices=[], value=None, interactive=False), ""
+        return "⚠️ 请输入文本", gr.update(choices=[], value=None, interactive=False), "", _build_console_html()
 
     segs = segment_text(text.strip(), max_chars=max_seg_len)
     with state:
         state.segments = segs
         state.segment_audios = [None] * len(segs)
+        state.segment_times = [None] * len(segs)
         state.segment_sr = 24000
         state.source_text = text.strip()
+        # 计时开始
+        if state.start_time == 0:
+            state.start_time = time.time()
 
     preview = preview_segments(text, max_seg_len)
     choices = [f"段 {i+1} ({len(seg)}字)" for i, seg in enumerate(segs)]
@@ -540,36 +653,41 @@ def do_segment(text: str, max_seg_len: int) -> Tuple[str, gr.update, str]:
 
     return preview, gr.update(
         choices=choices, value=choices[0] if choices else None, interactive=True
-    ), status
+    ), status, _build_console_html()
 
 
 def generate_segment(
     seg_label: str, language: str, max_new_tokens: int,
     temperature: float, top_k: int, top_p: int, repetition_penalty: float,
     subtalker_temperature: float, subtalker_top_k: int, subtalker_top_p: float,
-) -> Tuple[Optional[Tuple[int, np.ndarray]], str, str]:
+    enable_asr: bool = False,
+) -> Tuple[Optional[Tuple[int, np.ndarray]], str, str, str]:
     """Generate audio for a single selected segment."""
     with state as s:
         if not s.model_loaded or s.tts is None:
-            return None, "❌ 请先加载模型", get_session_label()
+            return None, "❌ 请先加载模型", get_session_label(), _build_console_html()
         if s.prompt_items is None:
-            return None, "❌ 请先创建音色克隆", get_session_label()
+            return None, "❌ 请先创建音色克隆", get_session_label(), _build_console_html()
         if not s.segments:
-            return None, "❌ 请先分段文本", get_session_label()
+            return None, "❌ 请先分段文本", get_session_label(), _build_console_html()
         tts = s.tts
         prompt_items = s.prompt_items
         segments = list(s.segments)
     if not seg_label:
-        return None, "❌ 请选择段落", get_session_label()
+        return None, "❌ 请选择段落", get_session_label(), _build_console_html()
 
     try:
         seg_idx = int(seg_label.split()[1]) - 1
     except (ValueError, IndexError):
-        return None, "❌ 无效的段落选择", get_session_label()
+        return None, "❌ 无效的段落选择", get_session_label(), _build_console_html()
     if seg_idx < 0 or seg_idx >= len(segments):
-        return None, "❌ 段号超出范围", get_session_label()
+        return None, "❌ 段号超出范围", get_session_label(), _build_console_html()
 
     seg_text = segments[seg_idx]
+
+    # 计时开始
+    t0 = time.time()
+
     gen_kwargs = dict(
         max_new_tokens=max_new_tokens, do_sample=True,
         top_k=top_k, top_p=top_p, temperature=temperature,
@@ -578,38 +696,106 @@ def generate_segment(
         subtalker_top_p=subtalker_top_p, subtalker_temperature=subtalker_temperature,
     )
 
-    try:
-        wavs, sr = tts.generate_voice_clone(
-            text=seg_text, language=language,
-            voice_clone_prompt=prompt_items, **gen_kwargs,
-        )
-        with state:
-            state.segment_audios[seg_idx] = wavs[0]
-            state.segment_sr = sr
-        # 自动保存到会话
-        _save_current_session()
-        return (sr, wavs[0]), get_segment_status_display(), get_session_label()
-    except Exception as e:
-        return None, f"❌ 段 [{seg_idx+1}] 生成失败: {e}\n\n{get_segment_status_display()}", get_session_label()
+    # ASR 校验（需要的话延迟初始化）
+    asr_available = False
+    if enable_asr:
+        asr_available = init_asr(quiet=True)
+
+    retry_kwargs = dict(gen_kwargs)
+    max_retry = 3 if enable_asr else 0
+    best_wav = None
+    best_sr = None
+    success = False
+    asr_result = ""  # 校验结果信息
+
+    for attempt in range(max_retry + 1):
+        try:
+            wavs, sr = tts.generate_voice_clone(
+                text=seg_text, language=language,
+                voice_clone_prompt=prompt_items, **retry_kwargs,
+            )
+            seg_wav = wavs[0]
+
+            if not enable_asr or not asr_available:
+                # 无校验 → 直接成功
+                elapsed = time.time() - t0
+                with state:
+                    state.segment_audios[seg_idx] = seg_wav
+                    state.segment_sr = sr
+                    if seg_idx < len(state.segment_times):
+                        state.segment_times[seg_idx] = elapsed
+                _save_current_session()
+                console = _build_console_html()
+                return (sr, seg_wav), get_segment_status_display(), get_session_label(), console
+
+            # ---- ASR 校验 ----
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            tmp_path = tmp.name
+            tmp.close()
+            sf.write(tmp_path, seg_wav, sr)
+
+            try:
+                passed, asr_text, asr_conf, fail_reason = verify_segment_head_tail(
+                    tmp_path, seg_text, language=language,
+                )
+            finally:
+                os.unlink(tmp_path)
+
+            if passed:
+                elapsed = time.time() - t0
+                with state:
+                    state.segment_audios[seg_idx] = seg_wav
+                    state.segment_sr = sr
+                    if seg_idx < len(state.segment_times):
+                        state.segment_times[seg_idx] = elapsed
+                _save_current_session()
+                asr_result = f" ✅ ASR✓"
+                status = f"✅ 段 [{seg_idx+1}] 生成完成{asr_result}\n{get_segment_status_display()}"
+                console = _build_console_html()
+                return (sr, seg_wav), status, get_session_label(), console
+            else:
+                if attempt == 0:
+                    best_wav, best_sr = seg_wav, sr
+                asr_result = f" ⚠️ ASR: {fail_reason}"
+                if attempt < max_retry:
+                    retry_kwargs["temperature"] = min(retry_kwargs["temperature"] + 0.1, 1.2)
+                else:
+                    # 最后一次也失败了，保留最佳版本
+                    elapsed = time.time() - t0
+                    with state:
+                        state.segment_audios[seg_idx] = best_wav
+                        state.segment_sr = best_sr or sr
+                        if seg_idx < len(state.segment_times):
+                            state.segment_times[seg_idx] = elapsed
+                    _save_current_session()
+                    status = f"⚠️ 段 [{seg_idx+1}] ASR 校验失败，已保留{asr_result}\n{get_segment_status_display()}"
+                    console = _build_console_html()
+                    return (best_sr or sr, best_wav), status, get_session_label(), console
+
+        except Exception as e:
+            return None, f"❌ 段 [{seg_idx+1}] 生成失败: {e}\n\n{get_segment_status_display()}", get_session_label(), _build_console_html()
+
+    return None, "❌ 未知错误", get_session_label(), _build_console_html()
 
 
 def generate_all_segments(
     language: str, max_new_tokens: int,
     temperature: float, top_k: int, top_p: int, repetition_penalty: float,
     subtalker_temperature: float, subtalker_top_k: int, subtalker_top_p: float,
+    enable_asr: bool = False,
     progress: gr.Progress = gr.Progress(),
-) -> Tuple[Optional[Tuple[int, np.ndarray]], str, str]:
-    """Generate all un-generated segments sequentially.
+) -> Tuple[Optional[Tuple[int, np.ndarray]], str, str, str]:
+    """Generate all un-generated segments sequentially with optional ASR verification.
 
     优化：单次加锁预计算 needed 列表，避免每段生成时重复 lock acquire/release。
     """
     with state as s:
         if not s.model_loaded or s.tts is None:
-            return None, "❌ 请先加载模型", get_session_label()
+            return None, "❌ 请先加载模型", get_session_label(), _build_console_html()
         if s.prompt_items is None:
-            return None, "❌ 请先创建音色克隆", get_session_label()
+            return None, "❌ 请先创建音色克隆", get_session_label(), _build_console_html()
         if not s.segments:
-            return None, "❌ 请先分段文本", get_session_label()
+            return None, "❌ 请先分段文本", get_session_label(), _build_console_html()
         tts = s.tts
         prompt_items = s.prompt_items
         segments = list(s.segments)
@@ -618,7 +804,12 @@ def generate_all_segments(
         needed = [i for i, a in enumerate(s.segment_audios) if a is None]
 
     if not needed:
-        return None, "✅ 所有段落已生成\n\n💡 请往下滚动到「音频后处理」区域，调整参数后点击「合并并输出」。\n\n" + get_segment_status_display(), get_session_label()
+        return None, "✅ 所有段落已生成\n\n💡 请往下滚动到「音频后处理」区域，调整参数后点击「合并并输出」。\n\n" + get_segment_status_display(), get_session_label(), _build_console_html()
+
+    # ASR 校验（延迟初始化）
+    asr_available = False
+    if enable_asr:
+        asr_available = init_asr(quiet=True)
 
     gen_kwargs = dict(
         max_new_tokens=max_new_tokens, do_sample=True,
@@ -631,19 +822,97 @@ def generate_all_segments(
     last_audio = None
     errors = 0
     need_count = len(needed)
+    verify_checked = 0
+    verify_passed = 0
+    verify_retried = 0
+    verify_failed = 0
 
     for seq_idx, i in enumerate(needed):
         progress((seq_idx + 0.5) / need_count, desc=f"合成段 [{i+1}/{total}]")
-        try:
-            wavs, sr = tts.generate_voice_clone(
-                text=segments[i], language=language,
-                voice_clone_prompt=prompt_items, **gen_kwargs,
-            )
-            with state:
-                state.segment_audios[i] = wavs[0]
-                state.segment_sr = sr
-            last_audio = (sr, wavs[0])
-        except Exception:
+        seg_text = segments[i]
+        t0 = time.time()
+
+        retry_kwargs = dict(gen_kwargs)
+        max_retry = 3 if enable_asr and asr_available else 0
+        seg_success = False
+        best_wav = None
+        best_sr_local = None
+
+        for attempt in range(max_retry + 1):
+            try:
+                wavs, sr_local = tts.generate_voice_clone(
+                    text=seg_text, language=language,
+                    voice_clone_prompt=prompt_items, **retry_kwargs,
+                )
+                seg_wav = wavs[0]
+                if attempt == 0:
+                    best_wav, best_sr_local = seg_wav, sr_local
+
+                if not enable_asr or not asr_available:
+                    # 无校验 → 直接保存
+                    elapsed = time.time() - t0
+                    with state:
+                        state.segment_audios[i] = seg_wav
+                        state.segment_sr = sr_local
+                        if i < len(state.segment_times):
+                            state.segment_times[i] = elapsed
+                    last_audio = (sr_local, seg_wav)
+                    seg_success = True
+                    break
+
+                # ---- ASR 校验 ----
+                verify_checked += 1
+                tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                tmp_path = tmp.name
+                tmp.close()
+                sf.write(tmp_path, seg_wav, sr_local)
+
+                try:
+                    passed, asr_text, asr_conf, fail_reason = verify_segment_head_tail(
+                        tmp_path, seg_text, language=language,
+                    )
+                finally:
+                    os.unlink(tmp_path)
+
+                if passed:
+                    verify_passed += 1
+                    elapsed = time.time() - t0
+                    with state:
+                        state.segment_audios[i] = seg_wav
+                        state.segment_sr = sr_local
+                        if i < len(state.segment_times):
+                            state.segment_times[i] = elapsed
+                    last_audio = (sr_local, seg_wav)
+                    seg_success = True
+                    break
+                else:
+                    if attempt == 0:
+                        best_wav, best_sr_local = seg_wav, sr_local
+                    if attempt < max_retry:
+                        verify_retried += 1
+                        retry_kwargs["temperature"] = min(
+                            retry_kwargs["temperature"] + 0.1, 1.2
+                        )
+                        progress((seq_idx + 0.5) / need_count,
+                                 desc=f"段 [{i+1}] ASR 重试 {attempt+1}/{max_retry}")
+                    else:
+                        verify_failed += 1
+                        elapsed = time.time() - t0
+                        with state:
+                            state.segment_audios[i] = best_wav
+                            state.segment_sr = best_sr_local or sr_local
+                            if i < len(state.segment_times):
+                                state.segment_times[i] = elapsed
+                        last_audio = (best_sr_local or sr_local, best_wav)
+                        seg_success = True
+                        break
+
+            except Exception:
+                if not seg_success:
+                    errors += 1
+                break
+
+        if not seg_success:
             errors += 1
 
     # 自动保存到会话
@@ -651,31 +920,43 @@ def generate_all_segments(
 
     with state:
         done = sum(1 for a in state.segment_audios if a is not None)
-    summary = f"✅ 已完成 {done}/{total} 段"
-    if errors:
-        summary += f" ({errors} 段失败)"
-    if done == total and not errors:
-        summary += "\n\n💡 所有段落已生成完成！请往下滚动到「音频后处理」区域，调整参数后点击「合并并输出」。"
-    elif done == total:
-        summary += "\n所有可用段落已生成完成"
-    else:
-        summary += "\n部分段落尚未生成，可继续生成"
 
-    return last_audio, f"{summary}\n{get_segment_status_display()}", get_session_label()
+    summary_lines = [f"✅ 已完成 {done}/{total} 段"]
+    if errors:
+        summary_lines.append(f" ({errors} 段失败)")
+
+    # ASR 校验报告
+    if enable_asr and asr_available and verify_checked > 0:
+        pct = verify_passed / max(verify_checked, 1) * 100
+        summary_lines.append(f"\n📊 ASR 校验：{verify_checked} 段校验")
+        summary_lines.append(f"   ✅ 一次通过: {verify_passed} ({pct:.0f}%)")
+        if verify_retried:
+            summary_lines.append(f"   ↻ 重试修正: {verify_retried}")
+        if verify_failed:
+            summary_lines.append(f"   ⚠️ 校验失败: {verify_failed}（已保留）")
+
+    if done == total and not errors:
+        summary_lines.append("\n💡 所有段落已生成完成！请往下滚动到「音频后处理」区域，调整参数后点击「合并并输出」。")
+    elif done == total:
+        summary_lines.append("\n所有可用段落已生成完成")
+    else:
+        summary_lines.append("\n部分段落尚未生成，可继续生成")
+
+    summary = "\n".join(summary_lines)
+    return last_audio, f"{summary}\n{get_segment_status_display()}", get_session_label(), _build_console_html()
 
 
 def merge_segments(
     speed: float, segment_gap: float, breathing_pause: float,
     progress: gr.Progress = gr.Progress(),
-) -> Tuple[Optional[Tuple[int, np.ndarray]], str, str]:
+) -> Tuple[Optional[Tuple[int, np.ndarray]], str, str, str]:
     """Merge all generated segments into final audio.
 
-    合并完成后立即释放 state.segment_audios 中的 numpy 数组引用，
-    让 GC 可以回收内存（尤其是多段合成时各段可能占用数百 MB）。
+    合并后保留各段音频在 state 中，方便调整后处理参数后再次合并。
     """
     with state as s:
         if not s.segment_audios or all(a is None for a in s.segment_audios):
-            return None, "❌ 没有已生成的段落，请先生成", get_session_label()
+            return None, "❌ 没有已生成的段落，请先生成", get_session_label(), _build_console_html()
 
         generated = [(i, a) for i, a in enumerate(s.segment_audios) if a is not None]
         total = len(s.segment_audios)
@@ -683,20 +964,20 @@ def merge_segments(
         sr = s.segment_sr
         all_wavs = [a for _, a in generated]
         seg_texts = [s.segments[i] for i, _ in generated]
-
-        # 合并前释放各段音频内存（已拷贝到 all_wavs）
-        s.segment_audios = [None] * total
+        # 注意：不释放 segment_audios，保留分段数据供调整参数后再次合并
 
     warn = ""
     if done < total:
         n_missing = total - done
         if n_missing == total:
-            return None, "❌ 所有段落均未生成，请先生成", get_session_label()
+            return None, "❌ 所有段落均未生成，请先生成", get_session_label(), _build_console_html()
         warn = f"⚠️ 还有 {n_missing} 段未生成，仅合并已生成的 {done}/{total} 段\n\n"
 
     progress(0.1, desc="后处理中...")
     pwavs = []
     for wav, stxt in zip(all_wavs, seg_texts):
+        # 音频归一化：淡入 + 音量统一 → 消除开头爆音和忽大忽小
+        wav = normalize_audio(wav, sr)
         if breathing_pause > 0:
             wav = insert_breathing_pauses(wav, stxt, sr, breathing_pause)
         pwavs.append((wav, sr))
@@ -736,7 +1017,7 @@ def merge_segments(
         f"{get_segment_status_display()}"
     )
 
-    return (sr, merged_wav), status, get_session_label()
+    return (sr, merged_wav), status, get_session_label(), _build_console_html()
 
 
 # =====================================================================
@@ -744,10 +1025,100 @@ def merge_segments(
 # =====================================================================
 
 CSS = """
-.gradio-container { max-width: 1200px !important; }
+.gradio-container { max-width: 1400px !important; }
 .status-box { min-height: 60px; }
 .seg-preview { font-family: monospace; font-size: 13px; }
 footer { display: none !important; }
+
+/* ---- 右侧控制台 ---- */
+.console-panel {
+    background: #f8f9fa;
+    border-radius: 8px;
+    padding: 16px;
+    font-size: 13px;
+    line-height: 1.6;
+    height: calc(100vh - 120px);
+    overflow-y: auto;
+    border: 1px solid #e0e0e0;
+}
+.console-title {
+    margin: 0 0 12px 0;
+    padding-bottom: 8px;
+    border-bottom: 2px solid #4a90d9;
+    font-size: 15px;
+    color: #333;
+}
+.console-section {
+    margin-bottom: 14px;
+}
+.console-section-title {
+    font-weight: 600;
+    font-size: 13px;
+    color: #555;
+    margin-bottom: 6px;
+}
+.console-step {
+    padding: 3px 0;
+    font-size: 12.5px;
+}
+.console-step.step-done { color: #2e7d32; }
+.console-step.step-active { color: #1565c0; font-weight: 600; }
+.console-step.step-pending { color: #999; }
+.console-hint {
+    margin-top: 4px;
+    font-size: 12px;
+    color: #888;
+    font-style: italic;
+}
+.console-stat {
+    display: flex;
+    justify-content: space-between;
+    padding: 2px 0;
+    font-size: 12.5px;
+    border-bottom: 1px solid #eee;
+}
+.console-stat .stat-label { color: #666; }
+.console-stat .stat-value { font-weight: 600; color: #333; }
+.console-timing {
+    font-size: 12px;
+    color: #555;
+    padding: 1px 0;
+    font-family: monospace;
+}
+
+/* ---- 左栏布局统一高度 ---- */
+.aligned-row {
+    display: flex;
+    align-items: stretch;
+}
+.aligned-row > * {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+}
+.btn-equal {
+    height: 100% !important;
+    min-height: 38px !important;
+}
+/* Propagate height through internal Gradio wrappers */
+.aligned-row .gr-box,
+.aligned-row .gr-form-item {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+}
+.aligned-row .wrap {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
+/* Force the actual input control (last child of wrap) to fill remaining space */
+.aligned-row .wrap > :not(label) {
+    flex: 1;
+    min-height: 0;
+}
 """
 
 
@@ -756,14 +1127,16 @@ footer { display: none !important; }
 # =====================================================================
 
 
-def do_new_session() -> Tuple[str, gr.update, str, str, str, Optional[str]]:
+def do_new_session() -> Tuple[str, gr.update, str, str, str, Optional[str], str]:
     """清空当前工作区，创建新会话。"""
     global state
     with state:
         state.segments = []
         state.segment_audios = []
+        state.segment_times = []
         state.source_text = ""
         state.session_name = _now_ts()
+        state.start_time = 0
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
     sessions = _list_sessions()
     return (
@@ -773,18 +1146,19 @@ def do_new_session() -> Tuple[str, gr.update, str, str, str, Optional[str]]:
         get_session_label(),
         "",
         None,  # 清空音频预览
+        _build_console_html(),
     )
 
 
-def do_load_session(timestamp: str) -> Tuple[str, gr.update, str, str, str, Optional[str]]:
+def do_load_session(timestamp: str) -> Tuple[str, gr.update, str, str, str, Optional[str], str]:
     """加载历史会话，恢复所有分段和音频。"""
     global state
     if not timestamp:
-        return "⚠️ 请选择一个会话", gr.update(), get_session_label(), "", "", None
+        return "⚠️ 请选择一个会话", gr.update(), get_session_label(), "", "", None, _build_console_html()
 
     meta, sr, audios = _load_session_into_state(timestamp)
     if meta is None:
-        return f"❌ 会话 {timestamp} 不存在", gr.update(), get_session_label(), "", "", None
+        return f"❌ 会话 {timestamp} 不存在", gr.update(), get_session_label(), "", "", None, _build_console_html()
 
     with state:
         state.segments = meta["segments"]
@@ -792,6 +1166,8 @@ def do_load_session(timestamp: str) -> Tuple[str, gr.update, str, str, str, Opti
         state.segment_sr = sr
         state.source_text = meta.get("source_text", "")
         state.session_name = timestamp
+        state.start_time = time.time()
+        state.segment_times = [None] * len(meta["segments"])
 
     preview = preview_segments(state.source_text or " ".join(state.segments), 500)
     choices = [f"段 {i+1} ({len(seg)}字)" for i, seg in enumerate(state.segments)]
@@ -802,6 +1178,7 @@ def do_load_session(timestamp: str) -> Tuple[str, gr.update, str, str, str, Opti
         get_session_label(),
         state.source_text,
         None,  # 清空之前的播放器
+        _build_console_html(),
     )
 
 
@@ -828,174 +1205,197 @@ def build_ui():
             """
         )
 
-        # ---- 状态显示 ----
+        # ---- 状态显示（顶部通栏） ----
         with gr.Row():
             model_status = gr.Textbox(label="模型状态", value="⏳ 等待加载", elem_classes="status-box")
             clone_status = gr.Textbox(label="音色状态", value="⏳ 等待创建", elem_classes="status-box")
             session_label = gr.Textbox(label="会话", value=get_session_label(), elem_classes="status-box")
 
-        # ---- 会话管理 ----
+        # ---- 主体：左（操作区）+ 右（控制台） ----
         with gr.Row():
-            session_selector = gr.Dropdown(
-                label="📂 历史会话", choices=_list_sessions(),
-                interactive=True, scale=3,
-                info="选择之前的合成结果来继续处理",
-            )
-            load_session_btn = gr.Button("📥 加载会话", variant="secondary", scale=1)
-            new_session_btn = gr.Button("📄 新建会话", variant="secondary", size="sm", scale=1)
+            # =============================================================
+            # 左栏：操作界面
+            # =============================================================
+            with gr.Column(scale=3):
+                # ---- 会话管理 ----
+                with gr.Row(elem_classes="aligned-row"):
+                    session_selector = gr.Dropdown(
+                        label="📂 历史会话", choices=_list_sessions(),
+                        interactive=True, scale=3,
+                        info="选择之前的合成结果来继续处理",
+                    )
+                    load_session_btn = gr.Button("📥 加载会话", variant="secondary", scale=1, elem_classes="btn-equal")
+                    new_session_btn = gr.Button("📄 新建会话", variant="secondary", scale=1, elem_classes="btn-equal")
 
-        # ---- 第一步：模型设置 ----
-        with gr.Accordion("⚙️ 模型设置", open=False):
-            with gr.Row():
-                model_path = gr.Textbox(
-                    label="模型名称/路径", value="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-                    info="HuggingFace ID 或本地路径（默认 1.7B 最佳音质）", scale=3,
-                )
-                device = gr.Dropdown(label="设备", choices=["mps", "cpu", "cuda:0"], value="mps", scale=1)
-                dtype = gr.Dropdown(label="精度", choices=["float32", "float16", "bfloat16"], value="float16", scale=1)
-            with gr.Row():
-                load_model_btn = gr.Button("🚀 加载模型", variant="primary")
-                unload_model_btn = gr.Button("⏏️ 卸载模型", variant="secondary", size="sm")
+                # ---- 第一步：模型设置 ----
+                with gr.Accordion("⚙️ 模型设置", open=False):
+                    with gr.Row(elem_classes="aligned-row"):
+                        model_path = gr.Textbox(
+                            label="模型名称/路径", value="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+                            info="HuggingFace ID 或本地路径（默认 1.7B 最佳音质）", scale=3,
+                        )
+                        device = gr.Dropdown(label="设备", choices=["mps", "cpu", "cuda:0"], value="mps", scale=1)
+                        dtype = gr.Dropdown(label="精度", choices=["float32", "float16", "bfloat16"], value="float16", scale=1)
+                    with gr.Row(elem_classes="aligned-row"):
+                        load_model_btn = gr.Button("🚀 加载模型", variant="primary", elem_classes="btn-equal")
+                        unload_model_btn = gr.Button("⏏️ 卸载模型", variant="secondary", elem_classes="btn-equal")
 
-        # ---- 第二步：音色克隆 ----
-        with gr.Group():
-            gr.Markdown("### 🎤 音色克隆")
-            # 参考音频历史（方便跨会话复用）
-            with gr.Row():
-                ref_history_dd = gr.Dropdown(
-                    label="📂 参考音频历史",
-                    choices=["-- 新建参考音频 --"] + ref_history.list_names(),
-                    value="-- 新建参考音频 --",
-                    interactive=True, scale=2,
-                    info="选择已保存的参考音频，点击「加载历史」自动填充",
-                )
-                ref_name = gr.Textbox(
-                    label="引用名称", scale=2,
-                    placeholder="填写名称，创建音色时将自动保存",
-                )
-                load_history_btn = gr.Button("📂 加载历史", variant="secondary", size="sm", scale=1)
-            with gr.Row():
-                ref_audio = gr.Audio(label="参考音频（录制或上传，3 秒以上效果更佳）", type="filepath")
-                ref_text = gr.Textbox(
-                    label="参考音频文字内容（ICL 模式必填）", lines=3,
-                    placeholder="输入参考音频中说话的内容...",
-                )
-            with gr.Row():
-                use_xvec = gr.Checkbox(label="x-vector only 模式（不需要参考文本）", value=False)
-                analyze_btn = gr.Button("🔍 分析声音特征", variant="secondary", size="sm")
-                clone_btn = gr.Button("🎯 创建音色", variant="primary")
-            voice_profile = gr.Textbox(label="声音特征分析", lines=6, max_lines=20, interactive=False, placeholder="点击「分析声音特征」查看结果...")
+                # ---- 第二步：音色克隆 ----
+                with gr.Group():
+                    gr.Markdown("### 🎤 音色克隆")
+                    with gr.Row(elem_classes="aligned-row"):
+                        ref_history_dd = gr.Dropdown(
+                            label="📂 参考音频历史",
+                            choices=["-- 新建参考音频 --"] + ref_history.list_names(),
+                            value="-- 新建参考音频 --",
+                            interactive=True, scale=2,
+                            info="选择已保存的参考音频，点击「加载历史」自动填充",
+                        )
+                        ref_name = gr.Textbox(
+                            label="引用名称", scale=2,
+                            placeholder="填写名称，创建音色时将自动保存",
+                        )
+                        load_history_btn = gr.Button("📂 加载历史", variant="secondary", scale=1, elem_classes="btn-equal")
+                    with gr.Row(elem_classes="aligned-row"):
+                        ref_audio = gr.Audio(label="参考音频（录制或上传，3 秒以上效果更佳）", type="filepath")
+                        ref_text = gr.Textbox(
+                            label="参考音频文字内容（ICL 模式必填）", lines=3,
+                            placeholder="输入参考音频中说话的内容...",
+                        )
+                    with gr.Row(elem_classes="aligned-row"):
+                        use_xvec = gr.Checkbox(label="x-vector only 模式（不需要参考文本）", value=False)
+                        analyze_btn = gr.Button("🔍 分析声音特征", variant="secondary", elem_classes="btn-equal")
+                        clone_btn = gr.Button("🎯 创建音色", variant="primary", elem_classes="btn-equal")
+                    voice_profile = gr.Textbox(label="声音特征分析", lines=6, max_lines=20, interactive=False, placeholder="点击「分析声音特征」查看结果...")
 
-        # ---- 第三步：文本输入 ----
-        with gr.Group():
-            gr.Markdown("### 📝 待合成文本")
-            with gr.Row():
-                text_input = gr.Textbox(label="输入文本", lines=10, placeholder="粘贴或输入要合成有声书的长文本...", scale=3)
-                text_file = gr.File(label="或上传 .txt 文件", file_types=[".txt"], scale=1)
+                # ---- 第三步：文本输入 ----
+                with gr.Group():
+                    gr.Markdown("### 📝 待合成文本")
+                    with gr.Row(elem_classes="aligned-row"):
+                        text_input = gr.Textbox(label="输入文本", lines=10, placeholder="粘贴或输入要合成有声书的长文本...", scale=3)
+                        text_file = gr.File(label="或上传 .txt 文件", file_types=[".txt"], scale=1)
 
-        # ---- 参数 ----
-        with gr.Accordion("🔧 生成参数", open=False):
-            with gr.Row():
-                language = gr.Dropdown(
-                    label="语言",
-                    choices=["Auto", "Chinese", "English", "Japanese", "Korean",
-                             "Spanish", "German", "French", "Russian", "Portuguese", "Italian"],
-                    value="Auto",
-                )
-                max_seg_len = gr.Slider(
-                    label="每段最大字符数", minimum=50, maximum=2000, value=350, step=50,
-                    info="决定文本被切分成多少段。值越小段数越多（每段更短），值越大段数越少（每段更长）。中文建议 300-500，英文建议 500-1000",
-                )
-                max_new_tokens = gr.Slider(
-                    label="每段最大 Token", minimum=256, maximum=8192, value=2048, step=256,
-                    info="控制每段生成的语音长度。数值越大，一次生成的语音越长，但超出此长度会被截断。建议 2048",
-                )
-            with gr.Row():
-                temperature = gr.Slider(
-                    label="温度", minimum=0.1, maximum=2.0, value=0.9, step=0.1,
-                    info="控制生成的随机性。调低 (=0.6)= 稳定可预测，适合小说朗读；调高 (>1.2)= 更有创意但可能不稳定",
-                )
-                top_k = gr.Slider(
-                    label="Top-K", minimum=1, maximum=100, value=50, step=1,
-                    info="限制模型每次只从概率最高的 K 个候选词中选择。调低 (=20)= 更保守；调高 (=80)= 更多变化",
-                )
-                top_p = gr.Slider(
-                    label="Top-P", minimum=0.1, maximum=1.0, value=1.0, step=0.05,
-                    info="累积概率采样，与 Top-K 配合使用。调低 (=0.8)= 更稳定；调高 (=1.0)= 保留全部可能性",
-                )
-                repetition_penalty = gr.Slider(
-                    label="重复惩罚", minimum=1.0, maximum=1.5, value=1.05, step=0.01,
-                    info="提高可减少字词重复和机械感，让韵律更丰富。太高(=1.3+)可能导致读音怪异",
-                )
-            with gr.Row():
-                gr.Markdown("##### 🎵 Subtalker（韵律控制）")
-            with gr.Row():
-                subtalker_temperature = gr.Slider(
-                    label="韵律温度", minimum=0.1, maximum=2.0, value=0.9, step=0.1,
-                    info="控制语调节奏的随机性。调低=语气更平更稳、语速偏快；调高=语气更生动、抑扬顿挫更丰富",
-                )
-                subtalker_top_k = gr.Slider(
-                    label="韵律 Top-K", minimum=1, maximum=100, value=50, step=1,
-                    info="控制韵律候选范围。调低 (=20)= 语调变化小、更平淡；调高 (=80)= 语调变化大、更自然",
-                )
-                subtalker_top_p = gr.Slider(
-                    label="韵律 Top-P", minimum=0.1, maximum=1.0, value=1.0, step=0.05,
-                    info="与韵律 Top-K 配合。调低 (=0.8)= 语调保守；调高 (=1.0)= 语调丰富，建议保持 1.0",
+                # ---- 参数 ----
+                with gr.Accordion("🔧 生成参数", open=False):
+                    with gr.Row(elem_classes="aligned-row"):
+                        language = gr.Dropdown(
+                            label="语言",
+                            choices=["Auto", "Chinese", "English", "Japanese", "Korean",
+                                     "Spanish", "German", "French", "Russian", "Portuguese", "Italian"],
+                            value="Auto",
+                        )
+                        max_seg_len = gr.Slider(
+                            label="每段最大字符数", minimum=50, maximum=2000, value=350, step=50,
+                            info="决定文本被切分成多少段。值越小段数越多（每段更短），值越大段数越少（每段更长）。中文建议 300-500，英文建议 500-1000",
+                        )
+                        max_new_tokens = gr.Slider(
+                            label="每段最大 Token", minimum=256, maximum=8192, value=2048, step=256,
+                            info="控制每段生成的语音长度。数值越大，一次生成的语音越长，但超出此长度会被截断。建议 2048",
+                        )
+                    with gr.Row(elem_classes="aligned-row"):
+                        temperature = gr.Slider(
+                            label="温度", minimum=0.1, maximum=2.0, value=0.9, step=0.1,
+                            info="控制生成的随机性。调低 (=0.6)= 稳定可预测，适合小说朗读；调高 (>1.2)= 更有创意但可能不稳定",
+                        )
+                        top_k = gr.Slider(
+                            label="Top-K", minimum=1, maximum=100, value=50, step=1,
+                            info="限制模型每次只从概率最高的 K 个候选词中选择。调低 (=20)= 更保守；调高 (=80)= 更多变化",
+                        )
+                        top_p = gr.Slider(
+                            label="Top-P", minimum=0.1, maximum=1.0, value=1.0, step=0.05,
+                            info="累积概率采样，与 Top-K 配合使用。调低 (=0.8)= 更稳定；调高 (=1.0)= 保留全部可能性",
+                        )
+                        repetition_penalty = gr.Slider(
+                            label="重复惩罚", minimum=1.0, maximum=1.5, value=1.05, step=0.01,
+                            info="提高可减少字词重复和机械感，让韵律更丰富。太高(=1.3+)可能导致读音怪异",
+                        )
+                    with gr.Row():
+                        gr.Markdown("##### 🎵 Subtalker（韵律控制）")
+                    with gr.Row(elem_classes="aligned-row"):
+                        subtalker_temperature = gr.Slider(
+                            label="韵律温度", minimum=0.1, maximum=2.0, value=0.9, step=0.1,
+                            info="控制语调节奏的随机性。调低=语气更平更稳、语速偏快；调高=语气更生动、抑扬顿挫更丰富",
+                        )
+                        subtalker_top_k = gr.Slider(
+                            label="韵律 Top-K", minimum=1, maximum=100, value=50, step=1,
+                            info="控制韵律候选范围。调低 (=20)= 语调变化小、更平淡；调高 (=80)= 语调变化大、更自然",
+                        )
+                        subtalker_top_p = gr.Slider(
+                            label="韵律 Top-P", minimum=0.1, maximum=1.0, value=1.0, step=0.05,
+                            info="与韵律 Top-K 配合。调低 (=0.8)= 语调保守；调高 (=1.0)= 语调丰富，建议保持 1.0",
+                        )
+                    with gr.Row():
+                        enable_asr = gr.Checkbox(
+                            label="✅ ASR 自动校验（适合隔夜任务）",
+                            value=False,
+                            info="用 Whisper 识别段头段尾缺字，瑕疵段自动重试（需要 pip install faster-whisper）",
+                        )
+
+                # ---- 第四步：分段预览 ----
+                with gr.Row():
+                    preview_btn = gr.Button("🔍 预览分段", variant="secondary", elem_classes="btn-equal")
+                seg_preview = gr.Textbox(
+                    label="分段预览", value="点击「预览分段」查看文本分割结果",
+                    lines=10, max_lines=20, interactive=False, elem_classes="seg-preview",
                 )
 
-        # ---- 第四步：分段预览 ----
-        with gr.Row():
-            preview_btn = gr.Button("🔍 预览分段", variant="secondary", size="sm")
-        seg_preview = gr.Textbox(
-            label="分段预览", value="点击「预览分段」查看文本分割结果",
-            lines=10, max_lines=20, interactive=False, elem_classes="seg-preview",
-        )
+                # ---- 第五步：逐段生成与试听 ----
+                gr.Markdown("### 🎯 逐段生成与试听")
+                gr.Markdown("切换段落选择器可试听已生成的音频；点击「生成/替换该段」可替换该段内容")
+                with gr.Row(elem_classes="aligned-row"):
+                    segment_selector = gr.Dropdown(
+                        label="选择段落", choices=[], interactive=False, scale=2,
+                    )
+                    gen_one_btn = gr.Button("▶️ 生成/替换该段", variant="secondary", scale=1, elem_classes="btn-equal")
+                    gen_all_btn = gr.Button("⏩ 生成所有未生成段", variant="secondary", scale=1, elem_classes="btn-equal")
+                with gr.Row():
+                    seg_audio_preview = gr.Audio(label="单段试听", type="numpy", interactive=False)
+                seg_status = gr.Textbox(
+                    label="段落状态", value="⏳ 请先预览分段",
+                    lines=8, max_lines=20, interactive=False, elem_classes="seg-preview",
+                )
 
-        # ---- 第五步：逐段生成与试听 ----
-        gr.Markdown("### 🎯 逐段生成与试听")
-        gr.Markdown("切换段落选择器可试听已生成的音频；点击「生成/替换该段」可替换该段内容")
-        with gr.Row():
-            segment_selector = gr.Dropdown(
-                label="选择段落", choices=[], interactive=False, scale=2,
-            )
-            gen_one_btn = gr.Button("▶️ 生成/替换该段", variant="secondary", scale=1)
-            gen_all_btn = gr.Button("⏩ 生成所有未生成段", variant="secondary", scale=1)
-        with gr.Row():
-            seg_audio_preview = gr.Audio(label="单段试听", type="numpy", interactive=False)
-        seg_status = gr.Textbox(
-            label="段落状态", value="⏳ 请先预览分段",
-            lines=8, max_lines=20, interactive=False, elem_classes="seg-preview",
-        )
+                # ---- 第六步：音频后处理 ----
+                gr.Markdown("### 🎛️ 音频后处理")
+                gr.Markdown("所有段落生成完成后，在此选择后处理参数并合并输出。合并后分段预览不丢失。")
+                with gr.Group():
+                    with gr.Row(elem_classes="aligned-row"):
+                        speed = gr.Slider(
+                            label="语速", minimum=0.5, maximum=1.5, value=0.9, step=0.05,
+                            info="0.9=稍慢更自然（推荐），0.7=明显变慢适合长文本，1.0=原速，1.2=偏快",
+                        )
+                        segment_gap = gr.Slider(
+                            label="段间停顿（秒）", minimum=0.0, maximum=5.0, value=1.5, step=0.1,
+                            info="段落之间的静音间隔。小说建议 1.0-2.0，文章建议 0.5-1.0",
+                        )
+                        breathing_pause = gr.Slider(
+                            label="气口停顿（秒）", minimum=0.0, maximum=1.0, value=0.25, step=0.05,
+                            info="句号/逗号处的短停顿。0=关闭，0.15=紧凑，0.25=自然（推荐），0.4=舒缓",
+                        )
+                    with gr.Row():
+                        merge_btn = gr.Button("🔗 合并已生成段落", variant="primary", size="lg", scale=2, elem_classes="btn-equal")
+                    with gr.Row():
+                        audio_output = gr.Audio(label="合并结果", type="numpy", interactive=False)
 
-        # ---- 第六步：音频后处理 ----
-        gr.Markdown("### 🎛️ 音频后处理")
-        gr.Markdown("所有段落生成完成后，在此选择后处理参数并合并输出。合并后分段预览不丢失。")
-        with gr.Group():
-            with gr.Row():
-                speed = gr.Slider(
-                    label="语速", minimum=0.5, maximum=1.5, value=0.9, step=0.05,
-                    info="0.9=稍慢更自然（推荐），0.7=明显变慢适合长文本，1.0=原速，1.2=偏快",
-                )
-                segment_gap = gr.Slider(
-                    label="段间停顿（秒）", minimum=0.0, maximum=5.0, value=1.5, step=0.1,
-                    info="段落之间的静音间隔。小说建议 1.0-2.0，文章建议 0.5-1.0",
-                )
-                breathing_pause = gr.Slider(
-                    label="气口停顿（秒）", minimum=0.0, maximum=1.0, value=0.25, step=0.05,
-                    info="句号/逗号处的短停顿。0=关闭，0.15=紧凑，0.25=自然（推荐），0.4=舒缓",
-                )
-            with gr.Row():
-                merge_btn = gr.Button("🔗 合并已生成段落", variant="primary", size="lg", scale=2)
-            with gr.Row():
-                audio_output = gr.Audio(label="合并结果", type="numpy", interactive=False)
+            # =============================================================
+            # 右栏：控制台
+            # =============================================================
+            with gr.Column(scale=1):
+                console_output = gr.HTML(value=_build_console_html(), label="控制台")
 
         # =====================================================================
         # 回调
         # =====================================================================
 
         # ---- 模型 ----
-        load_model_btn.click(fn=load_model, inputs=[model_path, device, dtype], outputs=[model_status])
-        unload_model_btn.click(fn=unload_model, outputs=[model_status])
+        load_model_btn.click(
+            fn=load_model, inputs=[model_path, device, dtype],
+            outputs=[model_status, console_output],
+        )
+        unload_model_btn.click(
+            fn=unload_model,
+            outputs=[model_status, console_output],
+        )
 
         # ---- 文件上传 ----
         text_file.upload(
@@ -1013,13 +1413,16 @@ def build_ui():
         clone_btn.click(
             fn=create_voice_clone,
             inputs=[ref_audio, ref_text, use_xvec, ref_name],
-            outputs=[clone_status, ref_history_dd],
+            outputs=[clone_status, ref_history_dd, console_output],
         )
 
         # ---- 会话管理 ----
         new_session_btn.click(
             fn=do_new_session,
-            outputs=[seg_preview, segment_selector, seg_status, session_label, text_input, seg_audio_preview],
+            outputs=[
+                seg_preview, segment_selector, seg_status, session_label,
+                text_input, seg_audio_preview, console_output,
+            ],
         ).then(
             fn=lambda: gr.update(choices=_list_sessions()),
             outputs=[session_selector],
@@ -1027,16 +1430,24 @@ def build_ui():
         load_session_btn.click(
             fn=do_load_session,
             inputs=[session_selector],
-            outputs=[seg_preview, segment_selector, seg_status, session_label, text_input, seg_audio_preview],
+            outputs=[
+                seg_preview, segment_selector, seg_status, session_label,
+                text_input, seg_audio_preview, console_output,
+            ],
         )
 
         # ---- 预览分段 ----
         gen_inputs = [text_input, max_seg_len]
-        seg_outputs = [seg_preview, segment_selector, seg_status]
-        preview_btn.click(fn=do_segment, inputs=gen_inputs, outputs=seg_outputs)
+        preview_btn.click(
+            fn=do_segment, inputs=gen_inputs,
+            outputs=[seg_preview, segment_selector, seg_status, console_output],
+        )
 
         # ---- 段落选择器切换 → 自动加载试听 ----
-        segment_selector.change(fn=on_segment_select, inputs=[segment_selector], outputs=[seg_audio_preview])
+        segment_selector.change(
+            fn=on_segment_select,
+            inputs=[segment_selector], outputs=[seg_audio_preview],
+        )
 
         # ---- 生成单段 ----
         gen_params = [
@@ -1046,22 +1457,22 @@ def build_ui():
         ]
         gen_one_btn.click(
             fn=generate_segment,
-            inputs=[segment_selector] + gen_params,
-            outputs=[seg_audio_preview, seg_status, session_label],
+            inputs=[segment_selector] + gen_params + [enable_asr],
+            outputs=[seg_audio_preview, seg_status, session_label, console_output],
         )
 
         # ---- 生成所有段 ----
         gen_all_btn.click(
             fn=generate_all_segments,
-            inputs=gen_params,
-            outputs=[seg_audio_preview, seg_status, session_label],
+            inputs=gen_params + [enable_asr],
+            outputs=[seg_audio_preview, seg_status, session_label, console_output],
         )
 
         # ---- 合并 ----
         merge_btn.click(
             fn=merge_segments,
             inputs=[speed, segment_gap, breathing_pause],
-            outputs=[audio_output, seg_status, session_label],
+            outputs=[audio_output, seg_status, session_label, console_output],
         )
 
     return demo

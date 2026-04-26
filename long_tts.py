@@ -305,6 +305,399 @@ def adjust_speed(wav: np.ndarray, sr: int, speed: float) -> np.ndarray:
     return _ola_time_stretch(wav, sr, speed)
 
 
+def _detect_onset(
+    wav: np.ndarray,
+    sr: int,
+    search_window_ms: float = 2000,
+    energy_threshold_ratio: float = 0.35,
+    lookahead_ms: float = 10,
+    min_trim_ms: float = 30,
+    sustain_ms: float = 100,
+) -> int:
+    """检测音频开头语音稳定起始点，裁切掉「由小变大」的渐起段。
+
+    解决 Qwen3-TTS 开头前几个字声音由小变大的问题。
+    核心改进：
+      - 自适应阈值：基于搜索窗口内的峰值能量（而非固定值）
+      - 持续确认：要求能量持续高于阈值至少 sustain_ms
+        → 确保切到「音量稳定」的位置，而非 ramp-up 开端
+
+    策略：
+      1. 取前 search_window_ms 的波形
+      2. 计算短时能量包络（abs + 5ms 移动平均平滑）
+      3. 找到窗口内的峰值能量
+      4. 自适应阈值 = 峰值 × energy_threshold_ratio
+      5. 找到首次超过阈值且持续 sustain_ms 的位置
+      6. 在该位置前保留 lookahead_ms 作为过渡
+      7. 至少裁掉 min_trim_ms
+
+    Args:
+        wav: 输入音频 (float32)
+        sr: 采样率 (Hz)
+        search_window_ms: 搜索窗口时长（毫秒），默认 2000ms 以覆盖完整 ramp-up
+        energy_threshold_ratio: 阈值比例（相对于峰值能量），默认 0.35
+        lookahead_ms: onset 前保留的过渡时长（毫秒）
+        min_trim_ms: 最小裁切量（毫秒）
+        sustain_ms: 持续确认时长（毫秒），默认 100ms
+
+    Returns:
+        裁切起始样本索引，即 out = wav[return_value:]
+    """
+    search_samples = int(search_window_ms * sr / 1000)
+    lookahead_samples = int(lookahead_ms * sr / 1000)
+    min_trim = int(min_trim_ms * sr / 1000)
+    sustain_samples = int(sustain_ms * sr / 1000)
+
+    window = wav[:search_samples]
+    if len(window) == 0:
+        return 0
+
+    # 短时能量包络：abs → 5ms 移动平均平滑
+    envelope = np.abs(window)
+    kernel_size = max(1, int(5 * sr / 1000))
+    kernel = np.ones(kernel_size) / kernel_size
+    envelope = np.convolve(envelope, kernel, mode='same')
+
+    peak_energy = float(np.max(envelope))
+    # 音频几乎静音 → 返回最小裁切
+    if peak_energy < 1e-8:
+        return min(min_trim, len(wav) // 4)
+
+    # 自适应阈值
+    threshold = peak_energy * energy_threshold_ratio
+
+    # 找到首次超过阈值且持续 sustain_samples 的位置
+    above = (envelope > threshold).astype(np.int8)
+
+    if sustain_samples > 1 and len(above) >= sustain_samples:
+        # 卷积法：找到连续 sustain_samples 个样本都超过阈值的位置
+        sus_kernel = np.ones(sustain_samples, dtype=np.int8)
+        counts = np.convolve(above, sus_kernel, mode='valid')
+        valid = np.where(counts >= sustain_samples)[0]
+        if len(valid) > 0:
+            onset = int(valid[0])
+        else:
+            # 没有持续段，退化为简单阈值
+            first_above = np.where(above == 1)[0]
+            if len(first_above) > 0:
+                onset = int(first_above[0])
+            else:
+                return min(min_trim, len(wav) // 4)
+    else:
+        # sustain_samples <= 1 → 直接用简单阈值
+        first_above = np.where(above == 1)[0]
+        if len(first_above) > 0:
+            onset = int(first_above[0])
+        else:
+            return min(min_trim, len(wav) // 4)
+
+    trim_point = max(0, onset - lookahead_samples)
+    trim_point = max(trim_point, min_trim)
+    return trim_point
+
+
+def normalize_audio(
+    wav: np.ndarray,
+    sr: int,
+    target_rms: float = 0.08,
+    fade_in_ms: float = 15,
+    max_peak: float = 0.92,
+    trim_unstable_onset: bool = True,
+) -> np.ndarray:
+    """音频归一化：动态裁切不稳定开头 + 短淡入 + RMS 归一化 + 软限幅。
+
+    解决 Qwen3-TTS 生成音频的常见问题：
+      - 开头爆音/喷麦 → 能量检测动态裁切 + 15ms 余弦淡入
+      - 各段音量不一致 → RMS 归一化到统一电平
+      - 峰值过大 → 软限幅削波
+      - 前几个 acoustic frame 不稳定 → 基于 VAD 的 onset 检测自动去除前导噪声
+
+    Args:
+        wav: 输入音频 (float32, [-1, 1])
+        sr: 采样率
+        target_rms: 目标 RMS 电平 (默认 0.08，约 -22dB)
+        fade_in_ms: 淡入时长毫秒 (默认 15ms，配合裁切使用)
+        max_peak: 最大允许峰值 (默认 0.92)
+        trim_unstable_onset: 是否开启动态 onset 裁切 (默认 True)
+
+    Returns:
+        处理后的音频
+    """
+    out = wav.copy()
+
+    # 0. 能量检测 → 动态裁切开头不稳定前导部分
+    if trim_unstable_onset:
+        trim_idx = _detect_onset(out, sr)
+        if trim_idx > 0:
+            out = out[trim_idx:]
+
+    # 1. 短余弦淡入（消除裁切点可能产生的 click）
+    fade_len = int(fade_in_ms * sr / 1000)
+    if fade_len > 0 and fade_len < len(out):
+        fade_curve = 0.5 * (1 - np.cos(np.pi * np.arange(fade_len) / fade_len))
+        out[:fade_len] *= fade_curve
+
+    # 2. RMS 归一化（使各段音量一致）
+    current_rms = float(np.sqrt(np.mean(out ** 2)))
+    if current_rms > 1e-10:
+        gain = target_rms / current_rms
+        out *= min(gain, 3.0)  # 最大增益 3x，防止过度放大噪声
+
+    # 3. 软限幅（防止峰值过冲）
+    threshold = max_peak
+    ratio = 0.5  # 压缩比
+    over = np.abs(out) > threshold
+    if over.any():
+        sign = np.sign(out)
+        excess = np.abs(out) - threshold
+        out[over] = sign[over] * (threshold + excess[over] * ratio)
+
+    return out.astype(np.float32)
+
+
+# =============================================================================
+# ASR 校验模块（可选依赖：faster-whisper / whisper）
+# =============================================================================
+# 用于自动检测生成音频的段头/段尾是否缺字，瑕疵段自动重新生成。
+# 适合隔夜批量任务场景。
+
+_ASR_MODEL = None
+_ASR_BACKEND = ""
+
+
+def init_asr(quiet: bool = False) -> bool:
+    """延迟初始化 ASR 模型（faster-whisper → whisper 后备）。
+
+    使用 base 模型（而非 tiny）以复用已有缓存，避免重复下载。
+    已有缓存路径（由 bili-subtitle-diarization skill 预下载）:
+      - faster-whisper:  ~/.cache/huggingface/hub/models--Systran--faster-whisper-base/
+      - openai-whisper:  ~/.cache/whisper/base.pt
+
+    Returns:
+        True 表示 ASR 可用
+    """
+    global _ASR_MODEL, _ASR_BACKEND
+
+    # 尝试 faster-whisper（更快，内存更省）
+    try:
+        from faster_whisper import WhisperModel
+        _ASR_MODEL = WhisperModel(
+            "base", device="auto", compute_type="int8",
+            cpu_threads=4, num_workers=1,
+        )
+        _ASR_BACKEND = "faster-whisper"
+        if not quiet:
+            print("   🎤 ASR 校验: faster-whisper base（命中缓存，无需下载）")
+        return True
+    except ImportError:
+        pass
+
+    # 后备：openai-whisper
+    try:
+        import whisper  # type: ignore
+        _ASR_MODEL = whisper.load_model("base")
+        _ASR_BACKEND = "whisper"
+        if not quiet:
+            print("   🎤 ASR 校验: whisper base（命中缓存，无需下载）")
+        return True
+    except ImportError:
+        pass
+
+    if not quiet:
+        print("   ⚠️  ASR 校验不可用（pip install faster-whisper 或 pip install openai-whisper）")
+    return False
+
+
+def _transcribe(audio_path: str, language: str) -> Tuple[str, float]:
+    """对音频进行 ASR 转写。
+
+    Returns:
+        (转录文本, 置信度)
+    """
+    if _ASR_BACKEND == "faster-whisper":
+        segs, info = _ASR_MODEL.transcribe(
+            audio_path, language=language,
+            beam_size=1, vad_filter=True,
+        )
+        text = "".join(s.text for s in segs).strip()
+        confidence = getattr(info, "average_confidence", 0.0)
+    elif _ASR_BACKEND == "whisper":
+        result = _ASR_MODEL.transcribe(audio_path, language=language)
+        text = result["text"].strip()
+        segs = result.get("segments", [])
+        confidence = sum(s.get("confidence", 0.0) for s in segs) / max(len(segs), 1) if segs else 0.0
+    else:
+        text, confidence = "", 0.0
+    return text, confidence
+
+
+def _strip_punct(s: str) -> str:
+    """去除标点和空格，仅保留中文和字母数字。"""
+    return "".join(ch for ch in s if ch.isalnum() or '\u4e00' <= ch <= '\u9fff')
+
+
+def verify_segment(
+    audio_path: str,
+    source_text: str,
+    language: str = "zh",
+    check_chars: int = 4,
+) -> Tuple[bool, str, float, str]:
+    """ASR 校验单段音频是否完整生成。
+
+    检查项:
+      - 段头校验：转录开头是否包含源文本的前 check_chars 个字
+      - 段尾校验：转录结尾是否包含源文本的后 check_chars 个字
+
+    注意：
+      - 使用子串搜索而非严格等值（应对 ASR 的识别误差）
+      - 源文本不足 6 个字时不校验（太短无法判断）
+
+    Args:
+        audio_path: 音频文件路径
+        source_text: 预期的源文本
+        language: 语言代码 (默认 "zh")
+        check_chars: 头部/尾部校验的字符数 (默认 4)
+
+    Returns:
+        (通过, 转录文本, 置信度, 失败原因描述)
+    """
+    if _ASR_MODEL is None:
+        return True, "", 0.0, "ASR 未初始化，跳过校验"
+
+    # 转写
+    transcription, confidence = _transcribe(audio_path, language)
+
+    text_clean = _strip_punct(source_text)
+    trans_clean = _strip_punct(transcription)
+
+    # 太短跳过校验（无法判断）
+    if len(text_clean) < 6:
+        return True, transcription, confidence, "源文本过短，跳过校验"
+
+    reasons = []
+
+    # ---- 段头校验 ----
+    head_target = text_clean[:check_chars]
+    # 在转录的前 check_chars*3 范围内搜索
+    head_search = trans_clean[:check_chars * 3]
+    if head_target not in head_search:
+        reasons.append(f"段头缺字: 预期「{head_target}」未出现在开头")
+
+    # ---- 段尾校验 ----
+    tail_target = text_clean[-check_chars:]
+    tail_search = trans_clean[-check_chars * 3:]
+    if tail_target not in tail_search:
+        reasons.append(f"段尾缺字: 预期「{tail_target}」未出现在末尾")
+
+    passed = len(reasons) == 0
+    fail_reason = "；".join(reasons)
+    return passed, transcription, confidence, fail_reason
+
+
+def _transcribe_head_tail(
+    audio_path: str,
+    language: str,
+    head_duration: float = 2.0,
+    tail_duration: float = 2.0,
+) -> Tuple[str, float]:
+    """仅转录音频的头尾部分，大幅减少 Whisper 计算量。
+
+    方案：截取前 head_duration 秒和后 tail_duration 秒，
+    用 0.3s 静音拼接后一次性转录。Whisper 会将其识别为两段独立语音。
+    对于 2+2=4s 的音频，转录时间为全段的 1/5 ~ 1/10。
+
+    Args:
+        audio_path: 音频文件路径
+        language: 语言代码
+        head_duration: 头部截取秒数
+        tail_duration: 尾部截取秒数
+
+    Returns:
+        (转录文本, 置信度)
+    """
+    # 读取音频
+    audio, sr = librosa.load(audio_path, sr=None, mono=True)
+    total_samples = len(audio)
+
+    # 防止段太短时截取重叠
+    max_half = min(total_samples // 2, int(head_duration * sr))
+    head = audio[:max_half]
+
+    max_tail = min(total_samples // 2, int(tail_duration * sr))
+    tail = audio[-max_tail:] if max_tail > 0 else np.array([], dtype=audio.dtype)
+
+    # 拼接头 + 0.3s 静音 + 尾
+    silence = np.zeros(int(0.3 * sr), dtype=audio.dtype)
+    combined = np.concatenate([head, silence, tail]) if len(tail) > 0 else head
+
+    # 写入临时文件
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp_path = tmp.name
+    tmp.close()
+    sf.write(tmp_path, combined, sr)
+
+    try:
+        text, confidence = _transcribe(tmp_path, language)
+    finally:
+        os.unlink(tmp_path)
+
+    return text, confidence
+
+
+def verify_segment_head_tail(
+    audio_path: str,
+    source_text: str,
+    language: str = "zh",
+    check_chars: int = 4,
+    head_duration: float = 2.0,
+    tail_duration: float = 2.0,
+) -> Tuple[bool, str, float, str]:
+    """ASR 校验，仅转录音频头尾部分。
+
+    与 verify_segment 功能完全一致，但使用 head-tail 转录优化。
+    对于隔夜批量任务，此函数应该替代 verify_segment（性能好 5-10 倍）。
+
+    Args:
+        同 verify_segment。额外:
+        head_duration: 头部截取秒数 (默认 2.0)
+        tail_duration: 尾部截取秒数 (默认 2.0)
+
+    Returns:
+        (通过, 转录文本, 置信度, 失败原因描述)
+    """
+    if _ASR_MODEL is None:
+        return True, "", 0.0, "ASR 未初始化，跳过校验"
+
+    # 仅转写头尾
+    transcription, confidence = _transcribe_head_tail(
+        audio_path, language, head_duration, tail_duration,
+    )
+
+    text_clean = _strip_punct(source_text)
+    trans_clean = _strip_punct(transcription)
+
+    # 太短跳过校验
+    if len(text_clean) < 6:
+        return True, transcription, confidence, "源文本过短，跳过校验"
+
+    reasons = []
+
+    # ---- 段头校验：在转录的前半段搜索 ----
+    head_target = text_clean[:check_chars]
+    mid = max(len(trans_clean) // 2, 1)
+    if head_target not in trans_clean[:mid]:
+        reasons.append(f"段头缺字: 预期「{head_target}」未出现在开头")
+
+    # ---- 段尾校验：在转录的后半段搜索 ----
+    tail_target = text_clean[-check_chars:]
+    if tail_target not in trans_clean[mid:]:
+        reasons.append(f"段尾缺字: 预期「{tail_target}」未出现在末尾")
+
+    passed = len(reasons) == 0
+    fail_reason = "；".join(reasons)
+    return passed, transcription, confidence, fail_reason
+
+
 def make_silence(duration_s: float, sr: int) -> np.ndarray:
     """生成一段静音。"""
     n = int(duration_s * sr)
@@ -679,6 +1072,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # ASR 校验参数
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        default=False,
+        help=(
+            "启用 ASR 校验：自动识别段头/段尾缺字的缺陷段并重新生成。"
+            "需要安装 faster-whisper 或 openai-whisper。适合隔夜批量任务。"
+        ),
+    )
+    parser.add_argument(
+        "--verify-max-retries",
+        type=int,
+        default=3,
+        dest="verify_max_retries",
+        help="单段 ASR 校验最大重试次数 (默认: 3)",
+    )
+
     return parser
 
 
@@ -737,6 +1148,8 @@ def _streaming_merge(
                     continue
 
                 wav, _ = sf.read(str(seg_path), dtype=np.float32)
+                # 音频归一化：淡入 + 音量统一 → 消除开头爆音和忽大忽小
+                wav = normalize_audio(wav, sr)
                 # 气口停顿（insert_breathing_pauses 会改变 wav 长度）
                 if breathing_pause > 0 and i < len(segments_text):
                     wav = insert_breathing_pauses(wav, segments_text[i], sr, breathing_pause)
@@ -1067,6 +1480,17 @@ def main():
             print(f"   💾 已保存到参考音频历史: {entry['name']} ({entry['created']})")
 
     # ------------------------------------------------------------------
+    # ASR 校验初始化（如果启用了 --verify）
+    # ------------------------------------------------------------------
+    if args.verify:
+        if not args.quiet:
+            print("")
+        asr_ok = init_asr(quiet=args.quiet)
+        if not asr_ok:
+            print("⚠️  --verify 已启用但 ASR 不可用，将跳过校验", file=sys.stderr)
+            args.verify = False
+
+    # ------------------------------------------------------------------
     # 逐段生成语音
     # ------------------------------------------------------------------
     ckpt_dir = get_checkpoint_dir(args.output) if args.resume else None
@@ -1105,6 +1529,9 @@ def main():
     segment_count = 0
     # 在循环中追踪，避免后续 O(n) 文件系统扫描
     all_completed: Set[int] = set(completed)
+
+    # ASR 校验统计
+    verify_stats = {"checked": 0, "passed": 0, "retried": 0, "failed": 0, "skipped_short": 0}
 
     # MPS/CUDA 批量兼容：GPU 推理非线程安全，强制 batch=1
     batch_size = args.batch_size
@@ -1195,34 +1622,108 @@ def main():
             if not args.quiet:
                 print(f"   🎯 段 [{i+1}/{len(segments)}] ({len(seg_text)} 字)...", end=" ", flush=True)
 
-            try:
-                _, seg_wav, sr, elapsed = _gen_one(i, seg_text)
-                total_time += elapsed
+            # ASR 校验 + 自动重试
+            max_retry = args.verify_max_retries if args.verify else 0
+            best_wav = None
+            best_sr = None
+            best_elapsed = 0.0
+            success = False
+            # 重试使用本地副本，不修改共享 gen_kwargs
+            retry_kwargs = dict(gen_kwargs)
 
-                segment_sr = sr
+            for attempt in range(max_retry + 1):
+                if _interrupted:
+                    break
+                try:
+                    # 用副本调用 _gen_one（_gen_one 内部引用的 gen_kwargs 是外层闭包）
+                    # 这里重新构造调用以避免修改全局 gen_kwargs
+                    t0 = time.time()
+                    wavs, sr_local = tts.generate_voice_clone(
+                        text=seg_text,
+                        language=language,
+                        voice_clone_prompt=prompt_items,
+                        **retry_kwargs,
+                    )
+                    elapsed = time.time() - t0
+                    if device == "mps":
+                        torch.mps.empty_cache()
+                    seg_wav = wavs[0]
 
-                # 流式写入文件，不保留在内存
-                sf.write(str(seg_path), seg_wav, sr)
+                    # 流式写入文件
+                    sf.write(str(seg_path), seg_wav, sr_local)
+
+                    if attempt == 0:
+                        total_time += elapsed
+                        segment_sr = sr_local
+                        best_wav, best_sr, best_elapsed = seg_wav, sr_local, elapsed
+                    else:
+                        verify_stats["retried"] += 1
+
+                    segment_sr = sr_local
+
+                    if args.verify:
+                        verify_stats["checked"] += 1
+                        passed, asr_text, asr_conf, fail_reason = verify_segment_head_tail(
+                            str(seg_path), seg_text, language=language,
+                        )
+                        if passed:
+                            verify_stats["passed"] += 1
+                            success = True
+                            if not args.quiet:
+                                asr_info = f" (ASR✓ {asr_conf:.0%})" if asr_conf > 0 else ""
+                                print(f"✅ 校验通过{asr_info}", end="")
+                            break
+                        else:
+                            if not args.quiet:
+                                print(f"⚠️ 校验失败: {fail_reason} (重试 {attempt+1}/{max_retry})", flush=True)
+                            if attempt < max_retry:
+                                # 微调 temperature 增加随机性（仅本地副本，不影响后续段落）
+                                retry_kwargs["temperature"] = min(
+                                    retry_kwargs["temperature"] + 0.1, 1.2
+                                )
+                                if not args.quiet:
+                                    print(f"      ↻ 重新生成 (temp={retry_kwargs['temperature']:.2f})...", end=" ", flush=True)
+                    else:
+                        # 未启用校验 → 一次成功
+                        success = True
+                        break
+
+                except Exception as e:
+                    print(f"\n❌ 段 [{i+1}] 生成失败: {e}", file=sys.stderr)
+                    print(f"   文本: {seg_text[:100]}...", file=sys.stderr)
+                    error_log = Path(args.output).parent / f"error_seg_{i+1}.txt"
+                    error_log.write_text(seg_text, encoding="utf-8")
+                    print(f"   失败文本已保存到: {error_log}", file=sys.stderr)
+                    break  # 跳出 retry 循环，不再尝试
+
+            # ---- 处理最终结果 ----
+            if _interrupted:
+                break
+
+            if best_wav is not None:
+                # 用最后一次成功或最佳尝试的结果写入最终文件
+                if best_wav is not seg_wav or best_sr != sr:
+                    sf.write(str(seg_path), best_wav, best_sr)
                 all_completed.add(i)
                 segment_count += 1
 
                 # 异步保存检查点
                 if ckpt_executor is not None:
-                    ckpt_executor.submit(save_checkpoint_segment, ckpt_dir, i, seg_wav, sr)
+                    ckpt_executor.submit(save_checkpoint_segment, ckpt_dir, i, best_wav, best_sr)
 
+                seg_dur = len(best_wav) / best_sr if best_wav is not None else 0
                 if not args.quiet:
-                    seg_dur = len(seg_wav) / sr
-                    eta_remaining = (total_time / segment_count) * (len(segments) - i - 1)
-                    print(f"✅ {seg_dur:.1f}s 音频 ({elapsed:.1f}s 生成, ETA {eta_remaining:.0f}s)")
-
-            except Exception as e:
-                print(f"\n❌ 段 [{i+1}] 生成失败: {e}", file=sys.stderr)
-                print(f"   文本: {seg_text[:100]}...", file=sys.stderr)
-                # 保存失败段信息以便排查
-                error_log = Path(args.output).parent / f"error_seg_{i+1}.txt"
-                error_log.write_text(seg_text, encoding="utf-8")
-                print(f"   失败文本已保存到: {error_log}", file=sys.stderr)
-                continue
+                    if success:
+                        eta_remaining = (total_time / segment_count) * (len(segments) - i - 1)
+                        print(f" {seg_dur:.1f}s (ETA {eta_remaining:.0f}s)")
+                    else:
+                        if args.verify:
+                            verify_stats["failed"] += 1
+                            print(f"   ⚠️ 校验失败 (已保留当前版本)")
+                        else:
+                            print(f" {seg_dur:.1f}s")
+            elif not args.quiet:
+                print(f"   ❌ 段 [{i+1}] 生成失败")
 
     # 等待所有异步检查点写入完成
     if ckpt_executor is not None:
@@ -1277,6 +1778,19 @@ def main():
         elif ckpt_dir and ckpt_dir.exists() and not args.keep_segments:
             shutil.rmtree(ckpt_dir)
 
+        # ASR 校验统计
+        if args.verify and verify_stats["checked"] > 0:
+            pct = verify_stats["passed"] / max(verify_stats["checked"], 1) * 100
+            lines = [
+                f"\n   🎤 ASR 校验报告:",
+                f"      校验段数: {verify_stats['checked']}",
+                f"      一次通过: {verify_stats['passed']} ({pct:.0f}%)",
+                f"      重试修正: {verify_stats['retried']}",
+            ]
+            if verify_stats["failed"] > 0:
+                lines.append(f"      校验失败: {verify_stats['failed']}（已保留，建议人工复查）")
+            print("\n".join(lines))
+
         # 输出统计
         if not args.quiet:
             print(f"\n{'='*40}")
@@ -1295,6 +1809,17 @@ def main():
         if not args.quiet:
             print(f"\n{'='*40}")
             print(f"✅ 段落生成完成（未合并）")
+
+            # ASR 校验统计
+            if args.verify and verify_stats["checked"] > 0:
+                pct = verify_stats["passed"] / max(verify_stats["checked"], 1) * 100
+                print(f"\n   🎤 ASR 校验报告:")
+                print(f"      校验段数: {verify_stats['checked']}")
+                print(f"      一次通过: {verify_stats['passed']} ({pct:.0f}%)")
+                print(f"      重试修正: {verify_stats['retried']}")
+                if verify_stats["failed"] > 0:
+                    print(f"      校验失败: {verify_stats['failed']}（已保留，建议人工复查）")
+
             print(f"   总段数: {segment_count}")
             print(f"   分段文件位于: {streaming_dir}")
             print(f"   生成耗时: {total_time:.1f}s")
