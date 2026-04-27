@@ -396,28 +396,124 @@ def _detect_onset(
     return trim_point
 
 
-def normalize_audio(
+def level_loudness(
     wav: np.ndarray,
     sr: int,
     target_rms: float = 0.08,
+    strength: float = 1.0,
+) -> np.ndarray:
+    """响度均衡：双时间尺度 + 气口抑制。
+
+    用长程 RMS 参考（1.5s）计算增益，气口等短时低能量事件被平滑滤除，
+    不会触发增益放大。再通过短程/长程 RMS 比值定位气口帧，主动压低。
+
+    Args:
+        wav: 输入音频 (float32, [-1, 1])
+        sr: 采样率
+        target_rms: 目标 RMS 电平 (默认 0.08，约 -22dB)
+        strength: 均衡力度 0.0~1.0 (默认 1.0)
+            0.0 = 无效果
+            0.5 = 半程修正，保留部分原始动态
+            1.0 = 完全均衡到 target_rms
+
+    Returns:
+        均衡后的音频
+    """
+    out = wav.copy().astype(np.float64)
+    n = len(out)
+    if n < sr * 0.3:
+        return wav
+
+    # ── 1. 短时 RMS 包络（50ms 窗口, 25ms 步进） ──
+    frame_len = max(int(0.05 * sr), 1)
+    hop = max(int(0.025 * sr), 1)
+
+    frames = []
+    positions = []
+    for start in range(0, n - frame_len + 1, hop):
+        r = float(np.sqrt(np.mean(out[start:start + frame_len] ** 2)))
+        frames.append(max(r, 1e-10))
+        positions.append(start + frame_len // 2)
+    positions.append(n - 1)
+    frames.append(frames[-1] if frames else 1e-10)
+
+    rms_env = np.array(frames, dtype=np.float64)
+    pos = np.array(positions)
+
+    # ── 2. 平滑 RMS（300ms 窗口，去微波动） ──
+    smooth_n = max(int(0.3 * sr / hop), 2)
+    kernel = np.ones(smooth_n) / smooth_n
+    rms_env = np.convolve(rms_env, kernel, mode="same")
+
+    # ── 3. 长程参考 RMS（1.5s 窗口） ──
+    #     气口/呼吸声是短时事件（0.1~0.3s），几乎不影响长程均值
+    #     只有持续 1.5s+ 的音量变化才会被修正
+    long_n = max(int(1.5 * sr / hop), 2)
+    long_kernel = np.ones(long_n) / long_n
+    long_rms = np.convolve(rms_env, long_kernel, mode="same")
+
+    # ── 4. 增益曲线（基于长程参考，气口不触发） ──
+    gain_raw = (target_rms / long_rms) ** strength
+    gain_raw = np.clip(gain_raw, 0.05, 10.0)
+
+    # ── 5. 气口定位 & 主动抑制 ──
+    #     短程/长程比值：气口帧比值低（<<0.5），语音帧比值高（~1.0）
+    #     ratio = rms_env / long_rms
+    #     增加一个小 epsilon 防止 long_rms ≈ 0 时爆炸
+    ratio = rms_env / np.maximum(long_rms, 1e-10)
+    # 抑制因子：ratio < 0.3 → 全压制 (factor→0)
+    #           ratio > 0.6 → 无压制 (factor→1)
+    #           中间线性过渡
+    suppress = np.clip((ratio - 0.3) / 0.3, 0.0, 1.0)
+    # 气口帧 gain 被压低到 20%（比之前 0.3 更低）
+    breath_floor = 0.2
+    gain_raw = breath_floor + (gain_raw - breath_floor) * suppress
+
+    # ── 6. 平滑增益曲线（避免帧间突变） ──
+    smooth_gain_n = max(int(0.1 * sr / hop), 2)
+    kernel2 = np.ones(smooth_gain_n) / smooth_gain_n
+    gain_raw = np.convolve(gain_raw, kernel2, mode="same")
+
+    # ── 7. 插值到完整音频长度 ──
+    gain_full = np.interp(np.arange(n), pos, gain_raw)
+
+    # ── 8. 应用增益 ──
+    out *= gain_full
+
+    # ── 9. 软限幅（防止增益放大后的峰值过冲） ──
+    threshold = 0.92
+    over = np.abs(out) > threshold
+    if over.any():
+        ratio_lim = 0.3
+        sign = np.sign(out)
+        excess = np.abs(out) - threshold
+        out[over] = sign[over] * (threshold + excess[over] * ratio_lim)
+
+    return out.astype(np.float32)
+
+
+def normalize_audio(
+    wav: np.ndarray,
+    sr: int,
+    target_peak: float = 0.90,
     fade_in_ms: float = 15,
-    max_peak: float = 0.92,
+    max_peak: float = 0.95,
     trim_unstable_onset: bool = True,
 ) -> np.ndarray:
-    """音频归一化：动态裁切不稳定开头 + 短淡入 + RMS 归一化 + 软限幅。
+    """音频归一化：动态裁切不稳定开头 + 短淡入 + 峰值归一化 + 软限幅。
 
     解决 Qwen3-TTS 生成音频的常见问题：
       - 开头爆音/喷麦 → 能量检测动态裁切 + 15ms 余弦淡入
-      - 各段音量不一致 → RMS 归一化到统一电平
+      - 各段音量不一致 → 峰值归一化到统一电平（比 RMS 更直观，不受汉字间静音影响）
       - 峰值过大 → 软限幅削波
       - 前几个 acoustic frame 不稳定 → 基于 VAD 的 onset 检测自动去除前导噪声
 
     Args:
         wav: 输入音频 (float32, [-1, 1])
         sr: 采样率
-        target_rms: 目标 RMS 电平 (默认 0.08，约 -22dB)
+        target_peak: 目标峰值电平 (默认 0.90，约 -0.9dBFS)
         fade_in_ms: 淡入时长毫秒 (默认 15ms，配合裁切使用)
-        max_peak: 最大允许峰值 (默认 0.92)
+        max_peak: 软限幅阈值 (默认 0.95)
         trim_unstable_onset: 是否开启动态 onset 裁切 (默认 True)
 
     Returns:
@@ -437,13 +533,13 @@ def normalize_audio(
         fade_curve = 0.5 * (1 - np.cos(np.pi * np.arange(fade_len) / fade_len))
         out[:fade_len] *= fade_curve
 
-    # 2. RMS 归一化（使各段音量一致）
-    current_rms = float(np.sqrt(np.mean(out ** 2)))
-    if current_rms > 1e-10:
-        gain = target_rms / current_rms
+    # 2. 峰值归一化（以最大峰值为基准，不受汉字间间隔影响）
+    current_peak = float(np.max(np.abs(out)))
+    if current_peak > 1e-10:
+        gain = target_peak / current_peak
         out *= min(gain, 3.0)  # 最大增益 3x，防止过度放大噪声
 
-    # 3. 软限幅（防止峰值过冲）
+    # 3. 软限幅（防止峰值再次过冲）
     threshold = max_peak
     ratio = 0.5  # 压缩比
     over = np.abs(out) > threshold
@@ -461,6 +557,12 @@ def normalize_audio(
 # 用于自动检测生成音频的段头/段尾是否缺字，瑕疵段自动重新生成。
 # 适合隔夜批量任务场景。
 
+# 本机 Whisper 模型缓存路径（如果存在则不用下载）
+_LOCAL_WHISPER_PT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "whisper_models", "base.pt",
+)
+
 _ASR_MODEL = None
 _ASR_BACKEND = ""
 
@@ -468,10 +570,8 @@ _ASR_BACKEND = ""
 def init_asr(quiet: bool = False) -> bool:
     """延迟初始化 ASR 模型（faster-whisper → whisper 后备）。
 
-    使用 base 模型（而非 tiny）以复用已有缓存，避免重复下载。
-    已有缓存路径（由 bili-subtitle-diarization skill 预下载）:
-      - faster-whisper:  ~/.cache/huggingface/hub/models--Systran--faster-whisper-base/
-      - openai-whisper:  ~/.cache/whisper/base.pt
+    优先使用项目内的本地模型（whisper_models/base.pt），
+    避免重复下载。
 
     Returns:
         True 表示 ASR 可用
@@ -492,13 +592,15 @@ def init_asr(quiet: bool = False) -> bool:
     except ImportError:
         pass
 
-    # 后备：openai-whisper
+    # 后备：openai-whisper（优先使用本地模型文件）
     try:
         import whisper  # type: ignore
-        _ASR_MODEL = whisper.load_model("base")
+        model_path = _LOCAL_WHISPER_PT if os.path.isfile(_LOCAL_WHISPER_PT) else "base"
+        _ASR_MODEL = whisper.load_model(model_path)
         _ASR_BACKEND = "whisper"
+        source = "whisper_models/" if os.path.isfile(_LOCAL_WHISPER_PT) else "cache"
         if not quiet:
-            print("   🎤 ASR 校验: whisper base（命中缓存，无需下载）")
+            print(f"   🎤 ASR 校验: whisper base（{source}）")
         return True
     except ImportError:
         pass
